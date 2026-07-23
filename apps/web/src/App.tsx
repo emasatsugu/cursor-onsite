@@ -131,6 +131,7 @@ export default function App() {
     setItems([]);
     setRunning(false);
     setBanner(null);
+    socketRef.current?.unsubscribe();
   }
 
   async function handleSend(prompt: string) {

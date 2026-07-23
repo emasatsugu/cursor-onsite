@@ -140,21 +140,27 @@ export function addBrowserSub(threadId: string, ws: WebSocket): void {
   threadSubsEmptySince.delete(threadId);
 }
 
-export function removeBrowserSub(threadId: string, ws: WebSocket): void {
+export function removeBrowserSub(threadId: string, ws: WebSocket): string[] {
   const set = browserSubs.get(threadId);
-  if (!set) return;
+  if (!set) return [];
   set.delete(ws);
   if (set.size === 0) {
     browserSubs.delete(threadId);
     threadSubsEmptySince.set(threadId, Date.now());
+    return [threadId];
   }
+  return [];
 }
 
-export function removeBrowserSubFromAll(ws: WebSocket): void {
+/** @returns threadIds whose subscriber set just became empty */
+export function removeBrowserSubFromAll(ws: WebSocket): string[] {
+  const emptied: string[] = [];
   for (const [threadId, set] of browserSubs) {
     if (set.delete(ws) && set.size === 0) {
       browserSubs.delete(threadId);
       threadSubsEmptySince.set(threadId, Date.now());
+      emptied.push(threadId);
     }
   }
+  return emptied;
 }

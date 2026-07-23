@@ -12,6 +12,7 @@ import {
   touchVmHeartbeat,
   removeVm,
   threadIdsForVm,
+  clearThreadAssignment,
 } from "../memory/state.js";
 import { cpLog, debugPreview } from "../debug/log.js";
 
@@ -123,6 +124,7 @@ export function waitForPersistResponse(
 function handleDisconnect(externalId: string, reason: "close" | "heartbeat_timeout"): void {
   cpLog(`VM removed ${externalId} reason=${reason}`);
   const ws = vmSockets.get(externalId);
+  const threads = threadIdsForVm(externalId);
   removeVm(externalId);
 
   // Drop the socket if we're evicting for missed heartbeats (close path already closed).
@@ -134,18 +136,22 @@ function handleDisconnect(externalId: string, reason: "close" | "heartbeat_timeo
     }
   }
 
-  // Sticky assignment is kept in vmByThread for lazy reassign on next prompt
-  // (or same-VM reconnect). In-flight loops fail immediately.
-  const threads = threadIdsForVm(externalId);
+  // Fail in-flight loops, then clear sticky immediately so the slot is free
+  // (no zombie assignment blocking POST /threads after reconnect).
   for (const threadId of threads) {
-    if (!runningLoops.has(threadId)) continue;
-    for (const [toolCallId, waiter] of [...pendingToolCalls.entries()]) {
-      waiter.reject(
-        new Error(`VM ${externalId} disconnected during tool call ${toolCallId}`)
-      );
-      pendingToolCalls.delete(toolCallId);
+    if (runningLoops.has(threadId)) {
+      for (const [toolCallId, waiter] of [...pendingToolCalls.entries()]) {
+        waiter.reject(
+          new Error(`VM ${externalId} disconnected during tool call ${toolCallId}`)
+        );
+        pendingToolCalls.delete(toolCallId);
+      }
+      cpLog(`in-flight work on thread=${threadId} will fail (VM gone)`);
     }
-    cpLog(`in-flight work on thread=${threadId} will fail (VM gone)`);
+    clearThreadAssignment(threadId);
+    cpLog(
+      `cleared sticky thread=${threadId} (VM ${externalId} ${reason}) — slot free`
+    );
   }
 }
 
@@ -181,7 +187,7 @@ export function createVmWss(): WebSocketServer {
 
   wss.on("connection", (ws: WebSocket, _req: IncomingMessage) => {
     let externalId: string | null = null;
-    cpLog("VM socket connected (awaiting register)");
+    cpLog(`VM WS established (awaiting register, pool=${vmSockets.size})`);
 
     ws.on("message", (data) => {
       let msg: VmClientMessage;
@@ -197,8 +203,7 @@ export function createVmWss(): WebSocketServer {
           externalId = msg.externalId;
           registerVm(externalId, ws);
           cpLog(`← VM register ${externalId} (pool size=${vmSockets.size})`);
-          // Re-bind sticky threads after VM reconnect (assignment is otherwise only
-          // sent once at thread create).
+          // Sticky threads (if any) get re-bound after VM reconnect.
           for (const threadId of threadIdsForVm(externalId)) {
             cpLog(`re-send assignment thread=${threadId} → VM ${externalId}`);
             sendVm(ws, { type: "assignment", threadId }, externalId);
@@ -247,15 +252,26 @@ export function createVmWss(): WebSocketServer {
       }
     });
 
-    ws.on("close", () => {
+    ws.on("close", (code, reasonBuf) => {
+      const reason = reasonBuf?.toString() || "";
+      const id = externalId ?? "(unregistered)";
+      cpLog(
+        `VM WS closed id=${id} code=${code}` +
+          (reason ? ` reason=${reason}` : "") +
+          ` pool=${vmSockets.size}`
+      );
       if (externalId) {
         // Only handle if still in pool (heartbeat sweeper may have already removed it).
         if (vmSockets.has(externalId) || vmPool.has(externalId)) {
           handleDisconnect(externalId, "close");
         }
-      } else {
-        cpLog("VM socket closed before register");
       }
+    });
+
+    ws.on("error", (err) => {
+      cpLog(
+        `VM WS error id=${externalId ?? "(unregistered)"}: ${err.message}`
+      );
     });
   });
 

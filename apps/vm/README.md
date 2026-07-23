@@ -57,7 +57,7 @@ curl 'http://localhost:3002/debug/healthy'
 curl 'http://localhost:3002/debug/persist'
 curl 'http://localhost:3002/debug/restore?threadId=<uuid>'
 ```
-Watch CP logs / `GET http://localhost:3001/debug/state` to confirm pool eviction and re-register.
+Watch CP logs / `GET http://localhost:3001/debug` to confirm pool eviction and re-register.
 
 `VM_EXTERNAL_ID` is required:
 

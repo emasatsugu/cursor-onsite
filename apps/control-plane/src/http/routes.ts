@@ -12,23 +12,17 @@ import type {
 import { BlobStorage, Thread, Transcript } from "../db/index.js";
 import {
   assignVmToThread,
-  browserSubs,
   findAvailableVm,
-  getAssignedVm,
-  isVmAssigned,
   runningLoops,
-  threadSubsEmptySince,
-  vmByThread,
-  vmPool,
-  vmSockets,
 } from "../memory/state.js";
 import {
   createTranscriptWithUserPrompt,
   runAgentLoop,
 } from "../agent/loop.js";
 import { sendAssignment } from "../ws/vm.js";
-import { ensureConnectedVmForThread, IDLE_RECLAIM_MS } from "../assignment/lifecycle.js";
+import { ensureConnectedVmForThread } from "../assignment/lifecycle.js";
 import { cpLog } from "../debug/log.js";
+import { buildDebugSnapshot } from "../debug/snapshot.js";
 const DEMO_USER_ID = process.env.DEMO_USER_ID ?? "demo-user";
 
 function threadSummary(t: Thread): ThreadSummary {
@@ -47,53 +41,14 @@ export function createHttpRouter(): Router {
   });
 
   /**
-   * Debug: in-memory VM pool + assignments + browser subscriptions.
-   * GET /debug/state
+   * Debug: VM pool, sticky assignments, browser WS subscriptions / idle reclaim.
+   * GET /debug  or  GET /debug/state
    */
-  router.get("/debug/state", (_req: Request, res: Response) => {
-    const pool = [...vmPool.values()].map((vm) => {
-      const connected = vmSockets.has(vm.externalId);
-      const assigned = isVmAssigned(vm.externalId);
-      const threadIds = [...vmByThread.entries()]
-        .filter(([, ext]) => ext === vm.externalId)
-        .map(([threadId]) => threadId);
-      return {
-        externalId: vm.externalId,
-        connected,
-        assigned,
-        threadIds,
-        connectedAt: new Date(vm.connectedAt).toISOString(),
-        lastSeenAt: new Date(vm.lastSeenAt).toISOString(),
-        availableForNewThread: connected && !assigned,
-      };
-    });
-
-    const assignments = [...vmByThread.entries()].map(([threadId, vmExternalId]) => ({
-      threadId,
-      vmExternalId,
-      loopRunning: runningLoops.has(threadId),
-      browserSubscribers: browserSubs.get(threadId)?.size ?? 0,
-      vmConnected: vmSockets.has(vmExternalId),
-      subsEmptySince: threadSubsEmptySince.has(threadId)
-        ? new Date(threadSubsEmptySince.get(threadId)!).toISOString()
-        : null,
-      idleReclaimMs: IDLE_RECLAIM_MS,
-    }));
-
-    res.json({
-      pool,
-      assignments,
-      inMemory: {
-        connectedExternalIds: [...vmSockets.keys()],
-        vmByThread: Object.fromEntries(vmByThread),
-        runningLoops: [...runningLoops],
-        browserSubs: Object.fromEntries(
-          [...browserSubs.entries()].map(([threadId, set]) => [threadId, set.size])
-        ),
-      },
-      note: "VM pool + assignments are in-memory only (not persisted to DB).",
-    });
-  });
+  const debugHandler = (_req: Request, res: Response) => {
+    res.json(buildDebugSnapshot());
+  };
+  router.get("/debug", debugHandler);
+  router.get("/debug/state", debugHandler);
 
   router.get("/threads", async (_req: Request, res: Response) => {
     try {
@@ -209,7 +164,7 @@ export function createHttpRouter(): Router {
       if (!ensured) {
         res.status(503).json({
           error:
-            "No connected VM for thread (sticky down and no free VM to reassign)",
+            "No connected VM for thread (and no free VM to assign)",
         });
         return;
       }

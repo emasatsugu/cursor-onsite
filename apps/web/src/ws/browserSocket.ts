@@ -77,6 +77,15 @@ export class BrowserSocket {
     }
   }
 
+  /** Leave all thread subscriptions (e.g. draft / new-thread mode). */
+  unsubscribe(): void {
+    this.subscribedThreadId = null;
+    if (this.ws?.readyState === WebSocket.OPEN) {
+      const msg: BrowserClientMessage = { type: "unsubscribe" };
+      this.ws.send(JSON.stringify(msg));
+    }
+  }
+
   close(): void {
     this.intentionallyClosed = true;
     this.subscribedThreadId = null;

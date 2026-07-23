@@ -63,10 +63,9 @@ export type ThreadsListResponse = { threads: ThreadSummary[] };
 export type ApiError = { error: string };
 
 // --- Browser ↔ CP WS ---
-export type BrowserClientMessage = {
-  type: "subscribe";
-  threadId: string;
-};
+export type BrowserClientMessage =
+  | { type: "subscribe"; threadId: string }
+  | { type: "unsubscribe" };
 
 export type BrowserServerMessage =
   | {

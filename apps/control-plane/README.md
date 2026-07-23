@@ -23,7 +23,7 @@ Env: see `.env.example`. Set `OPENAI_API_KEY` and `MOCK_OPENAI=0` for real OpenA
 ## Endpoints
 
 - HTTP `GET/POST /threads`, `GET /threads/:id`, `POST /threads/:id/messages`, `GET /health`
-- HTTP `GET /debug/state` — VM pool, assignments, in-memory sockets / running loops
+- HTTP `GET /debug` (alias `/debug/state`) — `vmPool`, `assignments`, `browserWs` (+ idle reclaim timers)
 - WS `ws://localhost:3001/ws/browser` — subscribe-only streaming
 - WS `ws://localhost:3001/ws/vm` — VM register / heartbeat / tool responses
 

@@ -17,7 +17,7 @@ import {
   waitForToolCallResponse,
 } from "../ws/vm.js";
 import { getAssignedVm, vmSockets } from "../memory/state.js";
-import { requestPersist } from "../assignment/lifecycle.js";
+import { requestPersist, maybeReclaimThread } from "../assignment/lifecycle.js";
 import {
   buildSystemMessage,
   streamChatCompletion,
@@ -238,5 +238,6 @@ export async function runAgentLoop(
     });
   } finally {
     runningLoops.delete(threadId);
+    maybeReclaimThread(threadId);
   }
 }
