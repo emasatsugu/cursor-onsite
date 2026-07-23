@@ -6,6 +6,7 @@ import {
   vmSockets,
   vmPool,
   pendingToolCalls,
+  pendingPersists,
   runningLoops,
   registerVm,
   touchVmHeartbeat,
@@ -38,6 +39,23 @@ export function sendAssignment(externalId: string, threadId: string): boolean {
   }
   cpLog(`assignment thread=${threadId} → VM ${externalId}`);
   sendVm(ws, { type: "assignment", threadId }, externalId);
+  return true;
+}
+
+export function sendUnassign(externalId: string, threadId: string): boolean {
+  const ws = vmSockets.get(externalId);
+  if (!ws) return false;
+  sendVm(ws, { type: "unassign", threadId }, externalId);
+  return true;
+}
+
+export function sendPersistRequest(
+  externalId: string,
+  payload: Extract<VmServerMessage, { type: "persist_request" }>
+): boolean {
+  const ws = vmSockets.get(externalId);
+  if (!ws) return false;
+  sendVm(ws, payload, externalId);
   return true;
 }
 
@@ -79,6 +97,29 @@ export function waitForToolCallResponse(
   });
 }
 
+export function waitForPersistResponse(
+  requestId: string,
+  timeoutMs = 30_000
+): Promise<{ ok: boolean; error?: string }> {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      pendingPersists.delete(requestId);
+      reject(new Error(`persist_response timeout for ${requestId}`));
+    }, timeoutMs);
+
+    pendingPersists.set(requestId, {
+      resolve: (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      reject: (err) => {
+        clearTimeout(timer);
+        reject(err);
+      },
+    });
+  });
+}
+
 function handleDisconnect(externalId: string, reason: "close" | "heartbeat_timeout"): void {
   cpLog(`VM removed ${externalId} reason=${reason}`);
   const ws = vmSockets.get(externalId);
@@ -93,8 +134,8 @@ function handleDisconnect(externalId: string, reason: "close" | "heartbeat_timeo
     }
   }
 
-  // Sticky assignment is kept in vmByThread (follow-ups will 503 until that VM reconnects
-  // with the same externalId — which won't happen for this POC since VMs mint new IDs).
+  // Sticky assignment is kept in vmByThread for lazy reassign on next prompt
+  // (or same-VM reconnect). In-flight loops fail immediately.
   const threads = threadIdsForVm(externalId);
   for (const threadId of threads) {
     if (!runningLoops.has(threadId)) continue;
@@ -184,6 +225,18 @@ export function createVmWss(): WebSocketServer {
             waiter.resolve({ ok: msg.ok, result: msg.result });
           } else {
             cpLog(`← VM tool_call_response unmatched toolCallId=${msg.toolCallId}`);
+          }
+          return;
+        }
+
+        if (msg.type === "persist_response") {
+          cpLog(`← VM persist_response ${msg.requestId} ok=${msg.ok}`);
+          const waiter = pendingPersists.get(msg.requestId);
+          if (waiter) {
+            pendingPersists.delete(msg.requestId);
+            waiter.resolve({ ok: msg.ok, error: msg.error });
+          } else {
+            cpLog(`← VM persist_response unmatched requestId=${msg.requestId}`);
           }
           return;
         }

@@ -112,10 +112,22 @@ export type VmClientMessage =
       toolCallId: string;
       ok: boolean;
       result: ToolResultPayload;
+    }
+  | {
+      type: "persist_response";
+      requestId: string;
+      ok: boolean;
+      error?: string;
     };
 
 export type VmServerMessage =
   | { type: "assignment"; threadId: string }
+  | { type: "unassign"; threadId: string }
+  | {
+      type: "persist_request";
+      threadId: string;
+      requestId: string;
+    }
   | {
       type: "execute_tool_call";
       threadId: string;

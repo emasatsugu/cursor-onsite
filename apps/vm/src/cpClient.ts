@@ -261,6 +261,40 @@ export class ControlPlaneClient {
       return;
     }
 
+    if (msg.type === "unassign") {
+      this.log(`unassign threadId=${msg.threadId}`);
+      if (this.currentThreadId === msg.threadId) {
+        this.currentThreadId = null;
+      }
+      return;
+    }
+
+    if (msg.type === "persist_request") {
+      this.log(`persist_request ${msg.requestId} thread=${msg.threadId}`);
+      try {
+        if (!this.workspaceStore) {
+          throw new Error("workspace store not configured");
+        }
+        await this.workspaceStore.persist(msg.threadId, `cp persist ${msg.requestId}`);
+        this.currentThreadId = msg.threadId;
+        this.send({
+          type: "persist_response",
+          requestId: msg.requestId,
+          ok: true,
+        });
+      } catch (err) {
+        const error = err instanceof Error ? err.message : String(err);
+        this.log(`persist_request failed:`, error);
+        this.send({
+          type: "persist_response",
+          requestId: msg.requestId,
+          ok: false,
+          error,
+        });
+      }
+      return;
+    }
+
     if (msg.type === "execute_tool_call") {
       this.log(
         `executing tool ${msg.name} toolCallId=${msg.toolCallId}`,

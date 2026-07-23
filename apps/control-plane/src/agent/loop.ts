@@ -16,6 +16,8 @@ import {
   sendExecuteToolCall,
   waitForToolCallResponse,
 } from "../ws/vm.js";
+import { getAssignedVm, vmSockets } from "../memory/state.js";
+import { requestPersist } from "../assignment/lifecycle.js";
 import {
   buildSystemMessage,
   streamChatCompletion,
@@ -147,6 +149,15 @@ export async function runAgentLoop(
           threadId,
           transcriptId,
         });
+        // Best-effort checkpoint at end of turn (covers sudden death better).
+        const ext = getAssignedVm(threadId);
+        if (ext && vmSockets.has(ext)) {
+          try {
+            await requestPersist(ext, threadId);
+          } catch (err) {
+            console.error(`[agent] persist at loop_done failed thread=${threadId}`, err);
+          }
+        }
         return;
       }
 

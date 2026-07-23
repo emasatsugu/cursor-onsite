@@ -17,6 +17,7 @@ import {
   getAssignedVm,
   isVmAssigned,
   runningLoops,
+  threadSubsEmptySince,
   vmByThread,
   vmPool,
   vmSockets,
@@ -26,8 +27,8 @@ import {
   runAgentLoop,
 } from "../agent/loop.js";
 import { sendAssignment } from "../ws/vm.js";
+import { ensureConnectedVmForThread, IDLE_RECLAIM_MS } from "../assignment/lifecycle.js";
 import { cpLog } from "../debug/log.js";
-
 const DEMO_USER_ID = process.env.DEMO_USER_ID ?? "demo-user";
 
 function threadSummary(t: Thread): ThreadSummary {
@@ -73,6 +74,10 @@ export function createHttpRouter(): Router {
       loopRunning: runningLoops.has(threadId),
       browserSubscribers: browserSubs.get(threadId)?.size ?? 0,
       vmConnected: vmSockets.has(vmExternalId),
+      subsEmptySince: threadSubsEmptySince.has(threadId)
+        ? new Date(threadSubsEmptySince.get(threadId)!).toISOString()
+        : null,
+      idleReclaimMs: IDLE_RECLAIM_MS,
     }));
 
     res.json({
@@ -200,16 +205,18 @@ export function createHttpRouter(): Router {
         return;
       }
 
-      const externalId = getAssignedVm(threadId);
-      if (!externalId) {
-        res.status(503).json({ error: "No assignment for thread" });
+      const ensured = await ensureConnectedVmForThread(threadId);
+      if (!ensured) {
+        res.status(503).json({
+          error:
+            "No connected VM for thread (sticky down and no free VM to reassign)",
+        });
         return;
       }
-      if (!vmSockets.has(externalId)) {
-        res.status(503).json({ error: "Sticky VM not connected" });
-        return;
-      }
-      cpLog(`follow-up on sticky assignment thread=${threadId} → VM ${externalId}`);
+      cpLog(
+        `follow-up thread=${threadId} → VM ${ensured.externalId}` +
+          (ensured.reassigned ? " (reassigned)" : "")
+      );
 
       const { transcriptId, key } = await createTranscriptWithUserPrompt(
         threadId,
