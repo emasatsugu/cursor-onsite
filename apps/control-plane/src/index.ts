@@ -8,7 +8,7 @@ import { createHttpRouter } from "./http/routes.js";
 import { createBrowserWss, handleBrowserUpgrade } from "./ws/browserServer.js";
 import { createVmWss, handleVmUpgrade, startVmHeartbeatMonitor } from "./ws/vm.js";
 import { startIdleReclaimMonitor, IDLE_RECLAIM_MS } from "./assignment/lifecycle.js";
-import { hydrateAssignmentCache } from "./assignment/store.js";
+import { hydrateAssignmentCache, cpInstanceId } from "./assignment/store.js";
 
 const PORT = Number(process.env.PORT ?? 3001);
 
@@ -46,6 +46,7 @@ async function main(): Promise<void> {
 
   server.listen(PORT, () => {
     console.log(`[control-plane] HTTP+WS listening on :${PORT}`);
+    console.log(`[control-plane] CP_INSTANCE_ID=${cpInstanceId()}`);
     console.log(
       `[control-plane] MOCK_OPENAI=${shouldUseMockOpenAI() ? "on" : "off"}`
     );

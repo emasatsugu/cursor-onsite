@@ -2,10 +2,12 @@
 
 Node/Express + `ws` + Sequelize/SQLite. Owns `@poc/shared` and the agent loop.
 
-**SQLite (SoT):** threads, transcripts/blobs, `virtual_machines`, `assignments` (sticky routing).  
+**SQLite (SoT):** threads, transcripts/blobs, `virtual_machines` (+ `owner_cp_id`), `assignments`.  
 **In-memory:** live WS handles, connectedness / heartbeats, `vmByThread` cache, browser subs, running loops.
 
 On boot, active assignments are hydrated into the cache. VM disconnect / idle reclaim marks assignments `completed` and frees the slot; follow-ups assign any free connected VM on demand.
+
+**Multi-CP local demo:** `npm run start:cps` (ports `(N+3)*1000` → 4000, 5000, …) + `npm run start:proxy` (front door `:3001`). See `apps/cp-proxy/README.md`.
 
 ## Run
 
@@ -15,7 +17,11 @@ npm install
 npm run build:shared
 cp apps/control-plane/.env.example apps/control-plane/.env   # MOCK_OPENAI=1 by default
 npm run db:init          # creates data/poc.sqlite (optional; also runs on boot)
-npm run start:cp         # :3001
+npm run start:cp         # single CP on :3001
+
+# multi-CP:
+# npm run start:cps      # CP ids 1..N on :4000, :5000, …
+# npm run start:proxy    # :3001 → backends via owner_cp_id lookup
 ```
 
 DB helpers: `npm run db:init` / `npm run db:reset` (wipe + recreate).

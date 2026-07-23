@@ -20,6 +20,8 @@ export class VirtualMachine extends Model {
   declare id: string;
   declare externalId: string;
   declare status: "healthy" | "unhealthy";
+  /** Which CP process currently holds this VM's WS (`CP_INSTANCE_ID`). */
+  declare ownerCpId: string | null;
   declare readonly createdAt: Date;
   declare readonly updatedAt: Date;
 }
@@ -65,6 +67,7 @@ VirtualMachine.init(
       allowNull: false,
       defaultValue: "healthy",
     },
+    ownerCpId: { type: DataTypes.STRING, allowNull: true, field: "owner_cp_id" },
   },
   { sequelize, tableName: "virtual_machines", underscored: true }
 );
@@ -117,5 +120,8 @@ Transcript.belongsTo(Thread, { foreignKey: "threadId", as: "thread" });
 
 export async function initDb(options?: { force?: boolean }): Promise<void> {
   await sequelize.authenticate();
-  await sequelize.sync(options?.force ? { force: true } : undefined);
+  // alter: true so new columns (e.g. owner_cp_id) appear without a full reset.
+  await sequelize.sync(
+    options?.force ? { force: true } : { alter: true }
+  );
 }

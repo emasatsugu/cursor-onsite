@@ -14,6 +14,11 @@ import {
  * follow-ups assign any free connected VM on demand.
  */
 
+/** This process id — written to `virtual_machines.owner_cp_id` on register. */
+export function cpInstanceId(): string {
+  return process.env.CP_INSTANCE_ID?.trim() || "1";
+}
+
 export async function hydrateAssignmentCache(): Promise<void> {
   vmByThread.clear();
   const rows = await Assignment.findAll({
@@ -32,22 +37,23 @@ export async function hydrateAssignmentCache(): Promise<void> {
 }
 
 export async function upsertVmHealthy(externalId: string): Promise<VirtualMachine> {
+  const owner = cpInstanceId();
   const existing = await VirtualMachine.findOne({ where: { externalId } });
   if (existing) {
-    if (existing.status !== "healthy") {
-      await existing.update({ status: "healthy" });
-    }
+    await existing.update({ status: "healthy", ownerCpId: owner });
     return existing;
   }
-  return VirtualMachine.create({ externalId, status: "healthy" });
+  return VirtualMachine.create({
+    externalId,
+    status: "healthy",
+    ownerCpId: owner,
+  });
 }
 
 export async function markVmUnhealthy(externalId: string): Promise<void> {
   const vm = await VirtualMachine.findOne({ where: { externalId } });
   if (!vm) return;
-  if (vm.status !== "unhealthy") {
-    await vm.update({ status: "unhealthy" });
-  }
+  await vm.update({ status: "unhealthy", ownerCpId: null });
 }
 
 /** Create or reactivate sticky assignment; updates memory cache. */
@@ -87,6 +93,7 @@ export async function listActiveAssignmentsFromDb(): Promise<
     status: string;
     vmExternalId: string;
     vmStatus: string;
+    ownerCpId: string | null;
     updatedAt: string;
   }>
 > {
@@ -101,6 +108,7 @@ export async function listActiveAssignmentsFromDb(): Promise<
     status: row.status,
     vmExternalId: row.vm?.externalId ?? "(missing)",
     vmStatus: row.vm?.status ?? "(missing)",
+    ownerCpId: row.vm?.ownerCpId ?? null,
     updatedAt: row.updatedAt.toISOString(),
   }));
 }
@@ -110,6 +118,7 @@ export async function listVmsFromDb(): Promise<
     id: string;
     externalId: string;
     status: string;
+    ownerCpId: string | null;
     updatedAt: string;
   }>
 > {
@@ -118,6 +127,7 @@ export async function listVmsFromDb(): Promise<
     id: row.id,
     externalId: row.externalId,
     status: row.status,
+    ownerCpId: row.ownerCpId,
     updatedAt: row.updatedAt.toISOString(),
   }));
 }

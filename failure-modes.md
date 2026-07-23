@@ -1,6 +1,8 @@
 # Failure modes — VM + Control Plane (+ browser idle)
 
-Companion to `edd.md` / `implementation-edd.md`. Focus: what breaks between **control plane ↔ VM**, what we do about it, and **browser going idle** (subscriber drop → reclaim). OpenAI / tool-arg / path-traversal errors are listed only where they interact with that surface.
+Companion to `edd.md` / `implementation-edd.md`. Focus: **control plane ↔ VM**, **browser idle / reclaim**, and coupled transcript risks.
+
+**Audited against:** commits through `d59334f` (`from db working`) + current tree — DB SoT for VMs/assignments, disconnect clears sticky, `IDLE_RECLAIM_MS` default `0`.
 
 **Legend — Status**
 
@@ -12,55 +14,66 @@ Companion to `edd.md` / `implementation-edd.md`. Focus: what breaks between **co
 
 ---
 
+## Changelog since prior matrix
+
+| Was | Now |
+|---|---|
+| Assignments in-memory only; CP restart lost stickiness (**CP-01/02 TODO**) | DB SoT (`assignment/store.ts`); hydrate on boot; VM `register` → `upsertVmHealthy` + re-send sticky `assignment` |
+| Keep sticky across VM disconnect; lazy reassign on next prompt | **Complete** assignment on disconnect / reclaim (`persistClear`); follow-up **on-demand assigns any free VM** |
+| `IDLE_RECLAIM_MS` default 60s, sweeper-only | Default **0** (immediate when last sub leaves); also on `unsubscribe` / exclusive re-subscribe; sweeper as backup |
+| — | Browser `unsubscribe`; one socket → one thread (exclusive subscribe) |
+
+---
+
 ## 1. Primary matrix (VM + CP + browser idle)
 
 | ID | Failure | Detection | Immediate effect | Handling / recovery | User-visible | Status |
 |---|---|---|---|---|---|---|
-| **VM-01** | VM process kill / crash | WS `close` on CP | Socket dropped from `vmSockets` / `vmPool`; sticky `vmByThread` **kept** | Reject in-flight tool waiters → loop `agent_loop_error`; clear `runningLoops`. Same `VM_EXTERNAL_ID` reconnect → `register` → mark connected → **re-send `assignment`** + VM `restore` | Run fails mid-turn if any; follow-up works after reconnect (or lazy reassign) | **Handled** |
-| **VM-02** | VM WS close (network blip) | WS `close` | Same as VM-01 | VM auto-reconnect (~2s); CP re-sends sticky `assignment` on `register` | Brief tool/loop failure if mid-tool; otherwise silent | **Handled** |
-| **VM-03** | Missed heartbeats (hung / unhealthy sim) | CP sweeper: `lastSeenAt` > `VM_HEARTBEAT_TIMEOUT_MS` (default 30s) | Force-close socket; same as disconnect | Same as VM-01; `/debug/unhealthy` can pause heartbeats (+ optional persist first) | Same as VM-01 after timeout window | **Handled** |
-| **VM-04** | Sticky VM down on **new** thread | `findAvailableVm()` empty | — | `POST /threads` → **503** | “No healthy unassigned VM” | **Handled** |
-| **VM-05** | Sticky VM down on **follow-up** | `ensureConnectedVmForThread` | — | Prefer sticky if connected; else **lazy reassign** to free healthy VM + `assignment`/`restore`; else **503** | Follow-up succeeds on new VM if free; else 503 | **Handled** (in-memory SoT; DB SoT still TODO) |
-| **VM-06** | Mid-loop live migration | — | — | **Out of scope**: always fail the loop first; reassign only on a later prompt | `agent_loop_error`, then retry prompt | **Handled** (by policy) |
-| **VM-07** | Tool call: VM not connected at send | `sendExecuteToolCall` returns false | Throw in loop | `agent_loop_error`; blob left at last boundary | Error event on WS | **Handled** |
-| **VM-08** | Tool call: no response / hung tool | `waitForToolCallResponse` 60s timeout | Reject waiter | `agent_loop_error` | Error after ~60s | **Handled** |
-| **VM-09** | Tool execution failure (`ok: false`, edit uniqueness, path escape, shell nonzero) | VM returns `tool_call_response` | Result stringified into tool message | Loop continues; model sees error payload | Tool result row + model may retry/explain | **Handled** |
-| **VM-10** | `restore` fails on `assignment` / tool-call threadId | VM logs error | Workspace may be wrong/stale | Tools still run against current tree; no CP hard fail | Silent wrong files until noticed | **Partial** |
-| **VM-11** | `persist` fails after mutating tool | VM logs; no CP waiter | Durability window = last good persist | Continue; later reclaim/reassign may lose edits | Silent data loss risk | **Partial** |
-| **VM-12** | CP `persist_request` fails / times out (30s) | `waitForPersistResponse` / `ok: false` | At `agent_loop_done`: log only. On reclaim: log + continue release | Loop still `agent_loop_done`; reclaim still frees VM | Usually invisible; workspace may be stale on next restore | **Partial** |
-| **VM-13** | Hard kill mid-edit (no persist) | — | Unpersisted working-tree edits lost | Next `restore` = last checkpoint | Lost agent edits | **Partial** (by design; durability = last persist) |
-| **VM-14** | Parallel tools + VM dies mid-batch | Disconnect rejects pending waiters | `Promise.all` fails | `agent_loop_error`; may have dangling assistant `tool_calls` in blob | Error; follow-up context may be invalid | **Partial** (see T-02) |
-| **CP-01** | Control plane restart mid-generation | Process gone | In-memory sockets, `runningLoops`, waiters, browser subs **gone** | Boot: loops not resumed. Assignments today are **in-memory** → lost on restart unless re-wired from DB (spec wants DB SoT). Partial turn blobs remain in SQLite | Browser WS drops; in-flight run orphaned; sticky routing may break until reassign/new thread | **Partial** |
-| **CP-02** | CP restart, then VM re-registers | VM `register` | — | Spec: reload active assignments, re-send `assignment`. **Code today:** assignments not DB-backed → no sticky rebind after CP restart | Threads may need new create / manual recovery | **TODO** (DB SoT) |
-| **CP-03** | Concurrent second prompt on same thread | `runningLoops.has(threadId)` | — | **409** | “Generation already running” | **Handled** |
-| **CP-04** | OpenAI stream / API failure mid-loop | Exception in `streamChatCompletion` | — | Catch → `agent_loop_error`; no blob rollback | Error event; history at last boundary | **Handled** |
-| **CP-05** | Exceed `MAX_STEPS` (25) | Loop counter | — | `agent_loop_error` with max-steps message | Error event | **Handled** |
-| **CP-06** | Broadcast with **0** browser subscribers | `broadcastToThread` | Events dropped (no replay buffer) | History via `GET /threads/:id` is boundary-accurate only | Missed live stream; refresh shows last persisted boundary | **Handled** (best-effort WS) |
-| **CP-07** | Invalid / unmatched `tool_call_response` | No waiter for `toolCallId` | Log only | Orphan response ignored | None (or earlier timeout) | **Handled** |
-| **BR-01** | Browser tab close / navigate away | Browser WS `close` → `removeBrowserSubFromAll` | Sub count → 0; `threadSubsEmptySince` set | Agent loop **keeps running**; events may go to no one (CP-06). Idle reclaim clock starts | On return: history refresh; live mid-stream text may be missing | **Handled** |
-| **BR-02** | Browser WS idle disconnect / sleep | WS `close` + client reconnect (~1.5s) | Temporarily 0 subs | Re-`subscribe` on open; **no event replay** | Possible gap in live UI; reload history | **Partial** |
-| **BR-03** | Browser idle long enough to reclaim VM | Idle monitor: no subs for `IDLE_RECLAIM_MS` (default 60s), no running loop, had prior subs | Best-effort `persist_request` → `unassign` → `clearThreadAssignment` | VM returned to pool. Next follow-up: `ensureConnectedVmForThread` (may reassign different VM + `restore`) | Usually invisible if persist succeeded; else possible lost uncheckpointed edits | **Handled** |
-| **BR-04** | Idle reclaim while loop running | `runningLoops` check | — | Reclaim **skipped** | None | **Handled** |
-| **BR-05** | User never subscribed (prompt only) | `threadSubsEmptySince` never set | — | Idle reclaim **does not** fire (by design: only after had-subs → empty) | VM stays sticky indefinitely until subs appear then leave | **Handled** (policy) |
+| **VM-01** | VM process kill / crash | WS `close` on CP | Drop socket; DB VM → `unhealthy`; **complete** sticky assignment(s) | Reject in-flight tool waiters → `agent_loop_error`; `persistClear` frees slot. Reconnect → healthy in pool (no auto rebind; stickies already cleared). Next follow-up: `ensureConnectedVmForThread` → any free VM + `assignment`/`restore` | Mid-run fails; follow-up OK if any VM free | **Handled** |
+| **VM-02** | VM WS close (network blip) | WS `close` | Same as VM-01 (sticky cleared) | VM reconnect ~2s as free pool member; **not** re-bound to prior thread unless CP still had active row (normally cleared) | Mid-tool run fails; follow-up may land on different VM | **Handled** |
+| **VM-03** | Missed heartbeats | Sweeper: `lastSeenAt` > `VM_HEARTBEAT_TIMEOUT_MS` (30s) | Force-close; same as disconnect | Same as VM-01; `/debug/unhealthy` can pause heartbeats (+ optional persist first) | Same after timeout window | **Handled** |
+| **VM-04** | No free VM on **new** thread | `findAvailableVm()` empty | — | `POST /threads` → **503** | “No healthy unassigned VM” | **Handled** |
+| **VM-05** | No connected sticky on **follow-up** | `ensureConnectedVmForThread` | Scrub dead sticky if present | Assign any free connected VM + `persistAssign` + `assignment`/`restore`; else **503** | Follow-up on (possibly new) VM, or 503 | **Handled** |
+| **VM-06** | Mid-loop live migration | — | — | **Out of scope**: fail loop first; assign on a later prompt | `agent_loop_error`, then retry | **Handled** (by policy) |
+| **VM-07** | Tool call: VM not connected at send | `sendExecuteToolCall` false | Throw in loop | `agent_loop_error`; blob at last boundary | WS error event | **Handled** |
+| **VM-08** | Tool call hung / no response | `waitForToolCallResponse` 60s | Reject waiter | `agent_loop_error` | Error after ~60s | **Handled** |
+| **VM-09** | Tool exec failure (`ok: false`, edit uniqueness, path escape, shell nonzero) | `tool_call_response` | Result → tool message | Loop continues; model sees error | Tool result + model may recover | **Handled** |
+| **VM-10** | `restore` fails on `assignment` / tool-call threadId | VM logs | Workspace may be wrong/stale | Tools still run; no CP hard fail | Silent wrong files | **Partial** |
+| **VM-11** | `persist` fails after mutating tool | VM logs; no CP waiter | Durability = last good persist | Continue; reclaim/reassign may lose edits | Silent data-loss risk | **Partial** |
+| **VM-12** | CP `persist_request` fails / 30s timeout | `waitForPersistResponse` / `ok: false` | `agent_loop_done`: log only. Reclaim: log + still `persistClear` | Loop still done; slot freed even if checkpoint failed | Invisible; next restore may be stale | **Partial** |
+| **VM-13** | Hard kill mid-edit (no persist) | — | Unpersisted tree lost | Next `restore` = last checkpoint | Lost agent edits | **Partial** (by design) |
+| **VM-14** | Parallel tools + VM dies mid-batch | Disconnect rejects waiters | `Promise.all` fails | `agent_loop_error`; may leave dangling assistant `tool_calls` in blob | Error; follow-up may break OpenAI context | **Partial** (see **T-02**) |
+| **CP-01** | CP restart mid-generation | Process gone | In-memory sockets, `runningLoops`, waiters, browser subs **gone** | Boot: `hydrateAssignmentCache` from DB. **Do not** auto-resume loops. Partial blobs remain. Sticky rows that were still `active` survive | Browser WS drops; in-flight run orphaned; user may follow-up once a VM is up | **Partial** (no mid-gen resume — intentional) |
+| **CP-02** | CP restart, then VM re-registers | VM `register` | Upsert DB healthy; attach socket | Re-send `assignment` for any hydrated sticky threads on that `externalId` → VM `restore` | Sticky threads continue on same VM after both sides are back | **Handled** |
+| **CP-03** | Concurrent second prompt | `runningLoops.has` | — | **409** | “Generation already running” | **Handled** |
+| **CP-04** | OpenAI stream / API failure | Exception in stream | — | `agent_loop_error`; no blob rollback | Error; history at last boundary | **Handled** |
+| **CP-05** | Exceed `MAX_STEPS` (25) | Loop counter | — | `agent_loop_error` | Error event | **Handled** |
+| **CP-06** | Broadcast with 0 browser subscribers | `broadcastToThread` | Events dropped (no replay) | `GET /threads/:id` boundary-accurate only | Missed live stream | **Handled** (best-effort WS) |
+| **CP-07** | Unmatched `tool_call_response` | No waiter | Log only | Ignored | None / earlier timeout | **Handled** |
+| **CP-08** | Hydrated sticky after CP restart, no browser ever re-subscribes | Assignment stays `active` | VM slot stays reserved for that thread | No idle clock (`threadSubsEmptySince` unset). Slot frees when: VM disconnect, user follow-up scrub path, or user subs then leaves (reclaim) | One VM may stay “assigned” with no live client | **Partial** |
+| **BR-01** | Browser tab close / navigate away | WS `close` → `removeBrowserSubFromAll` | Subs → 0; `threadSubsEmptySince` set | Loop keeps running if any. **`maybeReclaimThreads`** (default immediate when idle) | Return: history refresh; live mid-stream may be missing | **Handled** |
+| **BR-02** | Browser WS blip / sleep + client reconnect (~1.5s) | Close then re-open + re-`subscribe` | With `IDLE_RECLAIM_MS=0`, reclaim may run on close **before** reconnect | Set grace (e.g. `3000`) to tolerate blips. No event replay either way | Possible missed deltas; assignment may churn to another VM on next prompt | **Partial** |
+| **BR-03** | Browser idle reclaim | Last sub gone + no loop; `IDLE_RECLAIM_MS` (default **0**) | Best-effort `persist` → `unassign` → `persistClear` | VM back in pool. Next follow-up on-demand assign + `restore` | Usually invisible if persist OK | **Handled** |
+| **BR-04** | Reclaim while loop running | `runningLoops` / sub-count checks | — | Reclaim deferred; `maybeReclaimThread` in loop `finally` | None | **Handled** |
+| **BR-05** | User never subscribed (HTTP prompt only) | `threadSubsEmptySince` never set | — | Idle reclaim does **not** fire | VM stays sticky until disconnect or later sub→leave | **Handled** (policy) |
+| **BR-06** | Switch thread on same socket (exclusive subscribe) | Prior thread emptied | Reclaim prior thread if idle | New thread subscribed; old freed | Prior thread’s VM may be reclaimed | **Handled** |
 
 ---
 
-## 2. Transcript / workspace side effects (coupled to VM+CP failures)
-
-These are the main **follow-up correctness** risks when the modes above fire mid-turn. Spec TODOs live in `implementation-edd.md` Follow-ups.
+## 2. Transcript / workspace side effects
 
 | ID | Failure | Why it matters | Desired handling | Status |
 |---|---|---|---|---|
-| **T-01** | Crash / error after `[user]` only (stream never finished) | Follow-up context is fine but thin | Leave blob; allow new turn or explicit retry UX | **Partial** (leave-as-is) |
-| **T-02** | Assistant + `tool_calls` persisted, tools not all written | Next OpenAI call gets dangling `tool_calls` → API error | On `agent_loop_error`: truncate to consistent prefix, or repair in `loadAllTurnMessages` | **TODO** |
-| **T-03** | Replay / regenerate after `agent_loop_error` | Unclear overwrite vs new Transcript; workspace side effects already applied | Product decision + optional workspace rollback | **TODO** |
-| **T-04** | Lazy reassign after idle reclaim / VM death | Correctness depends on last successful `persist` | Always `restore` on new `assignment`; document durability window | **Handled** (with VM-11/13 gaps) |
+| **T-01** | Error after `[user]` only (stream never finished) | Context thin but valid | Leave blob; optional retry UX | **Partial** (leave-as-is) |
+| **T-02** | Assistant + `tool_calls` written; not all `tool` results | Next OpenAI call can fail on dangling tool_calls | Truncate/repair on `agent_loop_error` or in `loadAllTurnMessages` | **TODO** |
+| **T-03** | Replay / regenerate after `agent_loop_error` | Overwrite vs new Transcript; workspace side effects already applied | Product decision + optional rollback | **TODO** |
+| **T-04** | On-demand assign after reclaim / VM death | Correctness = last successful `persist` | Always `restore` on `assignment` | **Handled** (gaps: **VM-11/13**) |
 
 ---
 
-## 3. Sequence sketches (failure paths)
+## 3. Sequence sketches
 
-### 3a. VM dies mid-tool
+### 3a. VM dies mid-tool (current policy)
 
 ```
 Browser          CP                         VM
@@ -70,60 +83,60 @@ Browser          CP                         VM
   |              |-- reject pending waiter -|
   | agent_loop_error                        |
   |<-------------|                          |
-  |              | keep sticky assignment   |
+  |              | persistClear (slot free) |
+  |              | DB VM → unhealthy        |
   |              |                          |-- reconnect + register -->
-  |              |<-- register --------------|
-  |              |-- assignment (re-send) -->|
-  |              |                          |-- restore(threadId)
-  | POST .../messages (later)               |
-  |------------->| sticky socket OK → loop  |
+  |              |<-- register (free pool) -|
+  | POST .../messages                       |
+  |------------->| ensureConnectedVm        |
+  |              | assign any free VM ------>| (maybe same, maybe not)
+  |              |-- assignment + restore -->|
 ```
 
-### 3b. Browser idle → reclaim → follow-up on (possibly) new VM
+### 3b. Browser leave → immediate reclaim (default `IDLE_RECLAIM_MS=0`)
 
 ```
 Browser          CP                         VM-A              VM-B
   | WS close     |                          |                 |
-  |------------->| subs=0, emptySince=now   |                 |
-  |              | … IDLE_RECLAIM_MS …      |                 |
+  |------------->| maybeReclaim (idle)      |                 |
   |              |-- persist_request ------>|                 |
-  |              |<-- persist_response -----|                 |
   |              |-- unassign ------------->|                 |
-  |              | clear assignment (A free)|                 |
+  |              | persistClear             |                 |
   | POST follow-up                          |                 |
   |------------->| ensureConnectedVm        |                 |
-  |              | (A or B free) ---------->| or ------------>|
+  |              | free A or B --------------------------->|
   |              |-- assignment + restore → |                 |
-  |              | run loop                 |                 |
 ```
 
-### 3c. CP restart mid-generation (current gap)
+### 3c. CP restart (DB SoT)
 
 ```
-  In-flight loop + sockets + vmByThread lost
-  SQLite transcripts/blobs survive (last boundary)
-  VM still connected to dead CP → reconnects to new CP as fresh register
-  Without DB-backed assignments: sticky mapping not restored → treat as pool VM
+  In-flight loop + sockets + waiters gone
+  SQLite: threads, blobs, active assignments survive
+  Boot → hydrateAssignmentCache
+  VM register → upsert healthy → re-send assignment for hydrated stickies → restore
+  User follow-up (no mid-gen auto-resume)
 ```
 
 ---
 
 ## 4. Priority to harden next
 
-Ordered by demo risk / user pain:
+Ordered by demo risk / user pain (post–DB SoT):
 
-1. **T-02** — repair or truncate inconsistent turn blobs after mid-tool `agent_loop_error` (otherwise follow-ups can hard-fail against OpenAI).
-2. **CP-01 / CP-02** — persist `virtual_machines` + `assignments` in DB; reload + re-bind on boot / VM `register` (closes the “CP restart kills stickiness” hole).
-3. **VM-10 / VM-11** — surface `restore`/`persist` failures to CP (and optionally fail the loop or block reassign) instead of log-only.
-4. **BR-02** — optional: mark UI “disconnected / may have missed stream” and auto-refresh history on WS reconnect when a run was in progress.
+1. **T-02** — repair/truncate inconsistent turn blobs after mid-tool `agent_loop_error` (follow-ups can hard-fail against OpenAI).
+2. **VM-10 / VM-11 / VM-12** — surface `restore`/`persist` failures to CP (fail loop or block reclaim/reassign) instead of log-only + free-anyway.
+3. **BR-02** — default grace for reclaim (`IDLE_RECLAIM_MS>0`) and/or UI “disconnected; refresh history” on WS reconnect during a run.
+4. **CP-08** — reclaim or TTL hydrated stickies with no subscribers after CP restart (avoid reserved-but-idle VMs).
 5. **T-03** — explicit retry/replay UX after `agent_loop_error`.
 
 ---
 
 ## 5. Explicit non-goals (still)
 
-- Mid-loop live migration of a thread between VMs
+- Mid-loop live migration between VMs
 - Multi-CP ownership / assign locking
 - WS event replay buffer for browsers
+- Auto-resume of an in-flight agent loop after CP restart
 - Guaranteed durability across hard kill without a successful `persist`
 - Tool-level cancel mid-run (beyond failing the whole loop)
