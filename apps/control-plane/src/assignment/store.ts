@@ -7,11 +7,11 @@ import {
 } from "../memory/state.js";
 
 /**
- * DB is source of truth for VM rows + sticky assignments.
- * `vmByThread` is a cache rebuilt on boot and updated on every write.
+ * DB is source of truth for VM rows + sticky assignments while this CP is up.
+ * `vmByThread` is a write-through cache (not restored across CP restart).
  *
- * Policy (matches runtime): sticky cleared on VM disconnect / reclaim;
- * follow-ups assign any free connected VM on demand.
+ * Policy: sticky cleared on VM disconnect / idle reclaim / **CP boot**;
+ * follow-ups assign any free connected VM on demand (`restore` loads workspace).
  */
 
 /** This process id — written to `virtual_machines.owner_cp_id` on register. */
@@ -19,21 +19,19 @@ export function cpInstanceId(): string {
   return process.env.CP_INSTANCE_ID?.trim() || "1";
 }
 
-export async function hydrateAssignmentCache(): Promise<void> {
+/**
+ * CP restart: drop all stickies. Live sockets are gone; same-VM rebind is an
+ * optimization we can add later. Follow-ups use on-demand assign + restore.
+ */
+export async function clearActiveAssignmentsOnBoot(): Promise<void> {
   vmByThread.clear();
-  const rows = await Assignment.findAll({
-    where: { status: "active" },
-    include: [{ model: VirtualMachine, as: "vm" }],
-  });
-  for (const row of rows) {
-    const vm = row.vm;
-    if (!vm) {
-      cpLog(`hydrate: assignment ${row.id} missing vm — skipping`);
-      continue;
-    }
-    vmByThread.set(row.threadId, vm.externalId);
-  }
-  cpLog(`hydrated ${vmByThread.size} active assignment(s) from DB`);
+  const [n] = await Assignment.update(
+    { status: "completed" },
+    { where: { status: "active" } }
+  );
+  cpLog(
+    `boot: completed ${n} active assignment(s) — no sticky across CP restart`
+  );
 }
 
 export async function upsertVmHealthy(externalId: string): Promise<VirtualMachine> {

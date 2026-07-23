@@ -87,6 +87,19 @@ function dbGet<T>(
   });
 }
 
+function dbAll<T>(
+  db: sqlite3.Database,
+  sql: string,
+  params: unknown[] = []
+): Promise<T[]> {
+  return new Promise((resolve, reject) => {
+    db.all(sql, params, (err, rows) => {
+      if (err) reject(err);
+      else resolve((rows ?? []) as T[]);
+    });
+  });
+}
+
 async function ownerForThread(threadId: string): Promise<string | null> {
   const db = openDb();
   try {
@@ -119,9 +132,141 @@ async function ownerForVm(externalId: string): Promise<string | null> {
   }
 }
 
+type VmRow = {
+  external_id: string;
+  status: string;
+  owner_cp_id: string | null;
+  updated_at: string;
+};
+
+type AssignmentRow = {
+  thread_id: string;
+  status: string;
+  vm_external_id: string;
+  vm_status: string;
+  owner_cp_id: string | null;
+  updated_at: string;
+};
+
+/** Snapshot of routing tables the proxy uses (DB + configured backends). */
+async function buildMappingsSnapshot() {
+  const db = openDb();
+  try {
+    const vms = await dbAll<VmRow>(
+      db,
+      `SELECT external_id, status, owner_cp_id, updated_at
+       FROM virtual_machines
+       ORDER BY external_id ASC`
+    );
+    const assignments = await dbAll<AssignmentRow>(
+      db,
+      `SELECT a.thread_id AS thread_id,
+              a.status AS status,
+              vm.external_id AS vm_external_id,
+              vm.status AS vm_status,
+              vm.owner_cp_id AS owner_cp_id,
+              a.updated_at AS updated_at
+       FROM assignments a
+       JOIN virtual_machines vm ON vm.id = a.vm_id
+       WHERE a.status = 'active'
+       ORDER BY a.updated_at DESC`
+    );
+
+    return {
+      now: new Date().toISOString(),
+      proxyPort: PROXY_PORT,
+      databasePath: DB_PATH,
+      backends: backends.map((b) => ({
+        id: b.id,
+        url: `http://${b.host}:${b.port}`,
+        known: true,
+      })),
+      /** VM → which CP owns the live socket (null = disconnected / unknown). */
+      vmToOwner: vms.map((vm) => {
+        const backend = vm.owner_cp_id ? byId.get(vm.owner_cp_id) : undefined;
+        return {
+          externalId: vm.external_id,
+          status: vm.status,
+          ownerCpId: vm.owner_cp_id,
+          backendUrl: backend
+            ? `http://${backend.host}:${backend.port}`
+            : null,
+          updatedAt: vm.updated_at,
+        };
+      }),
+      /** Thread → VM → owner CP (active stickies only). */
+      threadToOwner: assignments.map((a) => {
+        const backend = a.owner_cp_id ? byId.get(a.owner_cp_id) : undefined;
+        return {
+          threadId: a.thread_id,
+          vmExternalId: a.vm_external_id,
+          vmStatus: a.vm_status,
+          ownerCpId: a.owner_cp_id,
+          backendUrl: backend
+            ? `http://${backend.host}:${backend.port}`
+            : null,
+          wouldRoute:
+            a.owner_cp_id && byId.has(a.owner_cp_id)
+              ? `cp-${a.owner_cp_id}`
+              : "round-robin (no/unknown owner)",
+          updatedAt: a.updated_at,
+        };
+      }),
+      note: "Routing is DB lookup thread→assignment→vm→owner_cp_id, not consistent hashing.",
+    };
+  } finally {
+    db.close();
+  }
+}
+
 function backendForOwner(ownerCpId: string | null | undefined): Backend {
   if (ownerCpId && byId.has(ownerCpId)) return byId.get(ownerCpId)!;
   return nextBackend();
+}
+
+/**
+ * CPs that currently own at least one healthy VM with no active assignment.
+ * Used so create / on-demand follow-up don't RR onto a saturated CP and 503
+ * while another CP still has a free VM.
+ */
+async function backendsWithFreeVm(): Promise<Backend[]> {
+  const db = openDb();
+  try {
+    const rows = await dbAll<{ owner_cp_id: string }>(
+      db,
+      `SELECT DISTINCT vm.owner_cp_id AS owner_cp_id
+       FROM virtual_machines vm
+       WHERE vm.status = 'healthy'
+         AND vm.owner_cp_id IS NOT NULL
+         AND NOT EXISTS (
+           SELECT 1 FROM assignments a
+           WHERE a.vm_id = vm.id AND a.status = 'active'
+         )`
+    );
+    const out: Backend[] = [];
+    for (const row of rows) {
+      const b = byId.get(row.owner_cp_id);
+      if (b) out.push(b);
+    }
+    return out;
+  } finally {
+    db.close();
+  }
+}
+
+async function pickBackendForAssign(): Promise<Backend> {
+  const free = await backendsWithFreeVm();
+  if (free.length === 0) {
+    log("no CP with free VM in DB — falling back to RR");
+    return nextBackend();
+  }
+  // Rotate among CPs that have capacity.
+  const b = free[rr % free.length]!;
+  rr += 1;
+  log(
+    `assign-route → cp-${b.id} (free owners: ${free.map((x) => x.id).join(",")})`
+  );
+  return b;
 }
 
 function threadIdFromPath(urlPath: string): string | null {
@@ -135,17 +280,26 @@ function threadIdFromPath(urlPath: string): string | null {
 async function pickHttpBackend(req: IncomingMessage): Promise<Backend> {
   const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "localhost"}`);
   const threadId = threadIdFromPath(url.pathname);
-  if (threadId && req.method !== "POST") {
-    // GET /threads/:id — any CP (shared DB); still prefer owner if known
-    const owner = await ownerForThread(threadId);
-    return backendForOwner(owner);
+
+  // New thread: must land on a CP that has a free local VM.
+  if (req.method === "POST" && url.pathname === "/threads") {
+    return pickBackendForAssign();
   }
+
   if (threadId && req.method === "POST") {
-    // Follow-up: must hit current owner when assigned; else RR (on-demand assign)
+    // Follow-up: sticky owner if assigned; else on-demand assign on a CP with capacity.
+    const owner = await ownerForThread(threadId);
+    if (owner && byId.has(owner)) return byId.get(owner)!;
+    return pickBackendForAssign();
+  }
+
+  if (threadId) {
+    // GET /threads/:id — any CP (shared DB); prefer owner if known
     const owner = await ownerForThread(threadId);
     return backendForOwner(owner);
   }
-  // POST /threads (create) or GET /threads — round-robin
+
+  // GET /threads list, etc.
   return nextBackend();
 }
 
@@ -174,6 +328,39 @@ function proxyHttp(req: IncomingMessage, res: ServerResponse, backend: Backend):
   req.pipe(preq);
 }
 
+/**
+ * `ws` rejects reserved/synthetic close codes (1005 No Status, 1006 Abnormal, …).
+ * Forwarding them verbatim crashes the process.
+ */
+function safeClose(
+  socket: WebSocket,
+  code?: number,
+  reason?: Buffer | string,
+): void {
+  if (socket.readyState !== WebSocket.OPEN && socket.readyState !== WebSocket.CONNECTING) {
+    return;
+  }
+  try {
+    if (
+      typeof code === "number" &&
+      Number.isInteger(code) &&
+      code >= 1000 &&
+      code <= 4999 &&
+      code !== 1004 &&
+      code !== 1005 &&
+      code !== 1006 &&
+      code !== 1015 &&
+      !(code > 1014 && code < 3000)
+    ) {
+      socket.close(code, reason);
+    } else {
+      socket.close();
+    }
+  } catch (err) {
+    log("safeClose ignored:", err instanceof Error ? err.message : err);
+  }
+}
+
 function pipeWs(client: WebSocket, upstream: WebSocket, label: string): void {
   const forward = (from: WebSocket, to: WebSocket, dir: string) => {
     from.on("message", (data, isBinary) => {
@@ -181,15 +368,11 @@ function pipeWs(client: WebSocket, upstream: WebSocket, label: string): void {
     });
     from.on("close", (code, reason) => {
       log(`${label} ${dir} close code=${code}`);
-      if (to.readyState === WebSocket.OPEN) to.close(code, reason);
+      safeClose(to, code, reason);
     });
     from.on("error", (err) => {
       log(`${label} ${dir} error:`, err.message);
-      try {
-        to.close();
-      } catch {
-        /* ignore */
-      }
+      safeClose(to);
     });
   };
   forward(client, upstream, "client→up");
@@ -267,63 +450,180 @@ async function handleBrowserUpgrade(
   client: WebSocket,
   req: IncomingMessage
 ): Promise<void> {
-  // Prefer ?threadId=; else wait for subscribe message (same as app protocol).
+  // Do NOT round-robin until we know the thread — otherwise the UI connects on
+  // page load, gets pinned to the wrong CP, and misses agent_loop_* events
+  // (hangs on "agent working").
   const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "localhost"}`);
   const qThread = url.searchParams.get("threadId");
 
-  const routeTo = async (threadId: string | null, buffered: typeof buf) => {
+  let upstream: WebSocket | null = null;
+  let upstreamOwnerKey: string | null = null; // backend id we are attached to
+  let attachChain: Promise<void> = Promise.resolve();
+
+  const attachUpstream = async (
+    threadId: string | null,
+    buffered: Array<{ data: WebSocket.RawData; isBinary: boolean }>
+  ): Promise<void> => {
     const owner = threadId ? await ownerForThread(threadId) : null;
-    const backend = backendForOwner(owner);
+    // Prefer known owner; if none yet, stay on current upstream when possible
+    // so a pre-assign subscribe does not bounce across CPs.
+    let backend: Backend;
+    if (owner && byId.has(owner)) {
+      backend = byId.get(owner)!;
+    } else if (upstream && upstream.readyState === WebSocket.OPEN && upstreamOwnerKey) {
+      backend = byId.get(upstreamOwnerKey) ?? nextBackend();
+    } else {
+      backend = nextBackend();
+    }
+    const ownerKey = backend.id;
+
+    const flushAndAck = () => {
+      for (const b of buffered) {
+        if (upstream && upstream.readyState === WebSocket.OPEN) {
+          upstream.send(b.data, { binary: b.isBinary });
+        }
+      }
+      // Local ack so the browser unblocks even if the CP `subscribed` frame is
+      // lost in a reattach race. Harmless duplicate if CP also acks.
+      if (threadId && client.readyState === WebSocket.OPEN) {
+        client.send(JSON.stringify({ type: "subscribed", threadId }));
+      }
+    };
+
+    // Already on the right backend — just flush any buffered frames.
+    if (upstream && upstream.readyState === WebSocket.OPEN && upstreamOwnerKey === ownerKey) {
+      flushAndAck();
+      log(
+        `browser WS keep cp-${backend.id}` +
+          (threadId ? ` thread=${threadId}` : "") +
+          (owner ? ` owner=${owner}` : " (sticky-up)")
+      );
+      return;
+    }
+
+    // Tear down previous upstream if switching owners (thread change / reassign).
+    if (upstream) {
+      try {
+        upstream.removeAllListeners();
+        upstream.close();
+      } catch {
+        /* ignore */
+      }
+      upstream = null;
+    }
+
     log(
       `browser WS → cp-${backend.id}` +
         (threadId ? ` thread=${threadId}` : "") +
         (owner ? ` owner=${owner}` : " (RR)")
     );
-    const upstream = connectUpstream(backend, req);
-    upstream.on("open", () => {
-      for (const b of buffered) {
-        upstream.send(b.data, { binary: b.isBinary });
+
+    const ws = connectUpstream(backend, req);
+    upstream = ws;
+    upstreamOwnerKey = ownerKey;
+
+    await new Promise<void>((resolve, reject) => {
+      const t = setTimeout(
+        () => reject(new Error(`upstream open timeout cp-${backend.id}`)),
+        5_000
+      );
+      ws.once("open", () => {
+        clearTimeout(t);
+        resolve();
+      });
+      ws.once("error", (err) => {
+        clearTimeout(t);
+        reject(err);
+      });
+    });
+
+    // Attach handlers BEFORE flushing subscribe — otherwise a fast `subscribed`
+    // / agent event can arrive and be dropped.
+    ws.on("message", (data, isBinary) => {
+      if (client.readyState === WebSocket.OPEN) {
+        client.send(data, { binary: isBinary });
       }
-      pipeWs(client, upstream, "browser");
     });
-    upstream.on("error", (err) => {
+    ws.on("close", (code, reason) => {
+      log(`browser up→client close code=${code}`);
+      if (upstream === ws) upstream = null;
+      // Do not close the browser client — allow re-subscribe to another CP.
+    });
+    ws.on("error", (err) => {
       log(`browser upstream error:`, err.message);
-      client.close(1011, "upstream error");
     });
+
+    flushAndAck();
   };
 
-  const buf: Array<{ data: WebSocket.RawData; isBinary: boolean }> = [];
+  const enqueueAttach = (
+    threadId: string | null,
+    buffered: Array<{ data: WebSocket.RawData; isBinary: boolean }>
+  ) => {
+    attachChain = attachChain
+      .catch(() => undefined)
+      .then(() => attachUpstream(threadId, buffered))
+      .catch((err) => {
+        log(`browser attach failed:`, err);
+        if (client.readyState === WebSocket.OPEN) {
+          client.send(
+            JSON.stringify({
+              type: "agent_loop_error",
+              threadId: threadId ?? "",
+              error: `proxy attach failed: ${err instanceof Error ? err.message : String(err)}`,
+            })
+          );
+        }
+      });
+    return attachChain;
+  };
+
+  client.on("message", (data, isBinary) => {
+    void (async () => {
+      // Parse subscribe/unsubscribe to (re)route before forwarding.
+      if (!isBinary) {
+        try {
+          const msg = JSON.parse(String(data)) as {
+            type?: string;
+            threadId?: string;
+          };
+          if (msg.type === "subscribe" && msg.threadId) {
+            await enqueueAttach(msg.threadId, [{ data, isBinary }]);
+            return; // forwarded + local subscribed ack in attach
+          }
+          if (msg.type === "unsubscribe") {
+            // Stay on current upstream; just forward unsubscribe.
+          }
+        } catch {
+          /* forward as-is */
+        }
+      }
+
+      if (upstream && upstream.readyState === WebSocket.OPEN) {
+        upstream.send(data, { binary: isBinary });
+        return;
+      }
+
+      // Not routed yet and not a subscribe — ignore (wait for subscribe).
+      log("browser WS dropped frame (waiting for subscribe)");
+    })();
+  });
+
+  client.on("close", (code, reason) => {
+    if (upstream) safeClose(upstream, code, reason);
+  });
+  client.on("error", () => {
+    if (upstream) safeClose(upstream);
+  });
 
   if (qThread) {
-    await routeTo(qThread, buf);
-    return;
-  }
-
-  let routed = false;
-  const onMsg = (data: WebSocket.RawData, isBinary: boolean) => {
-    if (routed) return;
-    buf.push({ data, isBinary });
-    if (isBinary) return;
     try {
-      const msg = JSON.parse(String(data)) as { type?: string; threadId?: string };
-      if (msg.type === "subscribe" && msg.threadId) {
-        routed = true;
-        client.off("message", onMsg);
-        void routeTo(msg.threadId, buf);
-      }
-    } catch {
-      /* wait */
+      await enqueueAttach(qThread, []);
+    } catch (err) {
+      log(`browser WS initial attach failed:`, err);
+      client.close(1011, "upstream error");
     }
-  };
-  client.on("message", onMsg);
-
-  // If they never subscribe, eventually attach to RR backend so health checks work.
-  setTimeout(() => {
-    if (routed) return;
-    routed = true;
-    client.off("message", onMsg);
-    void routeTo(null, buf);
-  }, 2000);
+  }
 }
 
 function main(): void {
@@ -343,6 +643,17 @@ function main(): void {
               databasePath: DB_PATH,
             })
           );
+          return;
+        }
+        if (
+          req.url === "/debug" ||
+          req.url === "/mappings" ||
+          req.url?.startsWith("/debug?") ||
+          req.url?.startsWith("/mappings?")
+        ) {
+          const snap = await buildMappingsSnapshot();
+          res.writeHead(200, { "content-type": "application/json" });
+          res.end(JSON.stringify(snap, null, 2));
           return;
         }
         const backend = await pickHttpBackend(req);

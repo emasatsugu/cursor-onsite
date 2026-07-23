@@ -8,13 +8,16 @@ import { createHttpRouter } from "./http/routes.js";
 import { createBrowserWss, handleBrowserUpgrade } from "./ws/browserServer.js";
 import { createVmWss, handleVmUpgrade, startVmHeartbeatMonitor } from "./ws/vm.js";
 import { startIdleReclaimMonitor, IDLE_RECLAIM_MS } from "./assignment/lifecycle.js";
-import { hydrateAssignmentCache, cpInstanceId } from "./assignment/store.js";
+import {
+  clearActiveAssignmentsOnBoot,
+  cpInstanceId,
+} from "./assignment/store.js";
 
 const PORT = Number(process.env.PORT ?? 3001);
 
 async function main(): Promise<void> {
   await initDb();
-  await hydrateAssignmentCache();
+  await clearActiveAssignmentsOnBoot();
 
   const app = express();
   app.use(

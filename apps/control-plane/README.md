@@ -5,7 +5,7 @@ Node/Express + `ws` + Sequelize/SQLite. Owns `@poc/shared` and the agent loop.
 **SQLite (SoT):** threads, transcripts/blobs, `virtual_machines` (+ `owner_cp_id`), `assignments`.  
 **In-memory:** live WS handles, connectedness / heartbeats, `vmByThread` cache, browser subs, running loops.
 
-On boot, active assignments are hydrated into the cache. VM disconnect / idle reclaim marks assignments `completed` and frees the slot; follow-ups assign any free connected VM on demand.
+On boot, any leftover `active` assignments are marked `completed` (no sticky across CP restart). VM disconnect / idle reclaim also complete assignments; follow-ups assign any free connected VM on demand and `restore` the workspace.
 
 **Multi-CP local demo:** `npm run start:cps` (ports `(N+3)*1000` → 4000, 5000, …) + `npm run start:proxy` (front door `:3001`). See `apps/cp-proxy/README.md`.
 

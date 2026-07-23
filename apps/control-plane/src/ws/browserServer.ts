@@ -40,6 +40,10 @@ export function createBrowserWss(): WebSocketServer {
         subscribedThreadId = msg.threadId;
         cpLog(`← browser subscribe thread=${msg.threadId} (exclusive)`);
         maybeReclaimThreads(emptied.filter((id) => id !== msg.threadId));
+        // Ack so clients can wait until they are on the right CP (via proxy) before prompting.
+        if (ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({ type: "subscribed", threadId: msg.threadId }));
+        }
       } else if (msg.type === "unsubscribe") {
         const emptied = removeBrowserSubFromAll(ws);
         subscribedThreadId = null;

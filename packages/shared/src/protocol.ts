@@ -69,6 +69,10 @@ export type BrowserClientMessage =
 
 export type BrowserServerMessage =
   | {
+      type: "subscribed";
+      threadId: string;
+    }
+  | {
       type: "assistant_message";
       threadId: string;
       transcriptId: string;

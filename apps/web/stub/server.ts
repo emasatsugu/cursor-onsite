@@ -330,6 +330,7 @@ wss.on("connection", (ws) => {
         subscribed = msg.threadId;
         if (!browserSubs.has(subscribed)) browserSubs.set(subscribed, new Set());
         browserSubs.get(subscribed)!.add(ws);
+        ws.send(JSON.stringify({ type: "subscribed", threadId: msg.threadId }));
       }
     } catch (err) {
       console.warn("bad browser WS message", err);

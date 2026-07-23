@@ -288,7 +288,7 @@ Tables:
 - `vmSockets: Map<externalId, WebSocket>`
 - `browserSubs: Map<threadId, Set<WebSocket>>`
 - `runningLoops: Set<threadId>`
-- `vmByThread: Map<threadId, externalId>` (cache of active Assignment; hydrated on boot)
+- `vmByThread: Map<threadId, externalId>` (write-through cache of active Assignment; cleared on CP boot)
 
 ### Transcript blob write contract (authoritative)
 
@@ -550,9 +550,10 @@ Same as above but `POST /threads/:id/messages`, skip VM picker / `assignment` (a
 
 - ~~Deterministic / stable VM `externalId` across restarts~~ (done: required `VM_EXTERNAL_ID` env)
 - ~~Workspace / git lifecycle on the VM~~ (done: shared GitHub repo; `threadId === branch`; persist after mutating tools; restore on assignment)
-- ~~Single-CP DB SoT for `virtual_machines` + `assignments`~~ (done: `assignment/store.ts`; hydrate on boot; disconnect/reclaim → `completed`)
+- ~~Single-CP DB SoT for `virtual_machines` + `assignments`~~ (done: `assignment/store.ts`; disconnect/reclaim/CP-boot → `completed`; no sticky hydrate across restart)
 - ~~Idle reclaim / on-demand free~~ (done: `IDLE_RECLAIM_MS` default 0; clear sticky on VM disconnect)
 - ~~CP→VM `persist` at `agent_loop_done`~~ (done: `persist_request` / `persist_response`)
+- **Optional later:** hydrate stickies across CP restart + same-VM rebind on `register` (optimization; workspace already via `restore` on assign)
 - **Maybe support branch:thread 1:many** — today branch ↔ thread is 1:1 (`threadId` is the branch name).
 - Multi-CP: sticky routing to the CP that holds the VM socket, assign locking across writers.
 - **How to handle replaying a user prompt** — retry / regenerate / resubmit: overwrite vs new Transcript, blob keep/discard, workspace side effects.
@@ -571,7 +572,7 @@ Scope: **one control-plane process**. Multi-CP later. Sockets, `runningLoops`, b
 |---|---|
 | Thread, transcripts, blobs | DB |
 | VM identity + last known health | DB `virtual_machines` |
-| Sticky thread → VM | DB `assignments` (SoT); `vmByThread` cache hydrated on boot |
+| Sticky thread → VM | DB `assignments` (SoT while CP up); `vmByThread` write-through cache; **cleared on CP boot** |
 | Live WS / connectedness | Memory only |
 
 **Stable VM id:** `VM_EXTERNAL_ID`.
@@ -580,7 +581,7 @@ Scope: **one control-plane process**. Multi-CP later. Sockets, `runningLoops`, b
 - One assignment row per thread (`threadId` unique); `status` `active` | `completed` (reactivate on later assign).
 - At most one **active** assignment per VM (`findAvailableVm` + cache).
 - New threads only to **connected** VMs with no active assignment.
-- **On-demand sticky:** VM disconnect / heartbeat eviction **completes** the assignment immediately (no zombie). Follow-ups use `ensureConnectedVmForThread` → any free connected VM.
+- **On-demand sticky:** VM disconnect / heartbeat eviction / **CP boot** **complete** assignments (no zombies across restart). Follow-ups use `ensureConnectedVmForThread` → any free connected VM.
 
 ### Workspace durability
 
@@ -589,10 +590,10 @@ Scope: **one control-plane process**. Multi-CP later. Sockets, `runningLoops`, b
 
 ### Event: CP restarts
 
-1. Boot: hydrate `assignments WHERE status=active` into `vmByThread`; sockets empty.
-2. Do not auto-resume mid-generation.
-3. VM `register` → upsert `healthy`; re-send `assignment` for still-active stickies on that VM.
-4. If disconnect already completed stickies, follow-up assigns a free VM on demand.
+1. Boot: mark all `active` assignments `completed`; `vmByThread` empty. Sockets empty.
+2. Do not auto-resume mid-generation. Partial turn blobs remain as written.
+3. VM `register` → upsert `healthy` into free pool (no sticky rebind).
+4. Follow-up → `ensureConnectedVmForThread` assigns any free VM + `restore`.
 
 ### Event: VM disconnect / unhealthy
 
@@ -603,7 +604,7 @@ Scope: **one control-plane process**. Multi-CP later. Sockets, `runningLoops`, b
 
 ### Event: browser idle reclaim
 
-- Default `IDLE_RECLAIM_MS=0` (reclaim when last browser sub leaves and no loop running).
+- Default `IDLE_RECLAIM_MS=30000` (reclaim after last browser sub is gone for 30s; set `0` for immediate).
 - Best-effort `persist_request`, `unassign`, mark assignment `completed`.
 
 ### Event: follow-up needs a VM (`ensureConnectedVmForThread`)
@@ -621,6 +622,75 @@ Scope: **one control-plane process**. Multi-CP later. Sockets, `runningLoops`, b
 | yes | healthy | yes | no | sticky on that VM |
 | no | unhealthy | no (cleared on disconnect) | no until reconnect | assign any free VM |
 
-### Multi-CP (explicitly later)
+### Multi-CP (current POC)
 
-Keep DB as SoT for assignments; add ownership / routing for which process holds the VM socket.
+Local stand-in: `npm run start:cps` + `apps/cp-proxy` (front door `:3001`). DB holds `owner_cp_id`; proxy routes by lookup (`thread → assignment → vm → owner`), not consistent hashing. Create / unowned follow-up prefer a CP that still has a free healthy VM. Each CP’s in-memory pool is **only locally connected** VMs — not the full cluster.
+
+Proxy must **not** perform assignment; it only routes. Assignment stays on the CP that holds the VM socket.
+
+---
+
+## Next steps (beyond POC)
+
+### Split placement from execution
+
+Today each control-plane process both **places** work (pick free VM, sticky/reclaim, write `assignments`) and **serves** it (VM WS, agent loop, browser fanout). That is fine for a single-node / small multi-CP demo, but free capacity is process-local while routing is global — which is why the proxy had to infer “who has a free VM” from DB.
+
+**Target architecture:**
+
+| Service | Responsibility |
+|---|---|
+| **Scheduler / assignment service** | Pool membership, free/busy, sticky leases, idle reclaim, reassign policy; single writer for placement. Issues leases: `thread → vm → workerId` (TTL + heartbeat). |
+| **Worker (executor)** | Holds VM sockets (or equivalent), runs agent loop, tool calls, persist/restore, streams to browser. Does not decide global placement — accepts leases. |
+| **Edge / LB** | Route HTTP+WS to the **worker named in the lease** (or to scheduler for “place then redirect”). Does not assign VMs. |
+
+**Lease model (replace ad-hoc sticky rows as SoT):** active lease = thread is using a VM on a worker; free VM = healthy/connected and no active lease. Workers report presence; scheduler is source of truth for placement.
+
+**Why split:**
+- One writer for assign/reclaim avoids cross-CP races and proxy capacity guessing
+- Workers scale horizontally for sockets + loops without each mirroring pool policy
+- Matches prod: control plane (placement) vs data plane (execution)
+
+**Out of scope until then:** keeping “full VM pool in every worker’s memory”; proxy-owned assignment; consistent-hash-as-placement.
+
+### Productionalizing the rest of the stack
+
+Beyond the scheduler/worker split, harden the seams the POC left soft:
+
+**Data & networking**
+- Replace shared SQLite with Postgres (or equivalent); use a queue/bus for “start loop” and browser events when the browser is not co-located with the worker
+- Presence store for connected VMs (e.g. Redis) — do not treat “healthy in DB” as “socket is live”
+
+**Runtime reliability**
+- First-class cancel / tool timeouts / max steps (client cancel, loop budget)
+- Idempotent prompts and explicit **replay / regenerate** semantics (see transcript failure TODOs)
+- Clear at-least-once vs exactly-once expectations for tool side effects; persist/restore as checkpoints with epochs
+- Defined resume policy after worker death (re-lease + restore) vs fail the turn
+
+**Isolation & tenancy**
+- Real authn/z (users, orgs); thread ACLs — drop hardcoded `DEMO_USER_ID`
+- One workspace per tenant/thread with hard sandboxing (not shared git credentials + path jail alone)
+- VM fleet as cattle: images, autoscaling, per-tenant quotas; stable VM identity via the orchestrator
+
+**Workspace / artifacts**
+- Replace ad-hoc GitHub branch-per-thread with a blob/snapshot store (or managed git) + retention
+- Network egress controls on `shell`; secret injection; audit log of tool calls
+
+**API & clients**
+- Versioned public API; SSE or multiplexed WS with replay cursors (not best-effort subscribe-only)
+- Backpressure, rate limits, abuse controls on prompts/tools
+
+**Observability & ops**
+- Structured traces across edge → scheduler → worker → VM → model
+- SLOs on assign latency, tool latency, loop success; alert on pool exhaustion
+- Multi-AZ deploy, rolling upgrades, graceful VM/worker drain
+
+**Model / cost**
+- Multi-model routing, spend caps, caching — do not hardcode a single OpenAI path in the worker
+
+**Keep from the POC**
+- Message contracts (`assignment` / tools / browser events), message-boundary transcript persistence, and “VM dials in” remain sound; production wraps them in leases, a real store, isolation, and an edge that only routes.
+
+### Other follow-ons
+
+- See **Follow-ups / TODOs** above (transcript replay / partial-turn consistency, optional sticky hydrate across CP restart, branch:thread cardinality).

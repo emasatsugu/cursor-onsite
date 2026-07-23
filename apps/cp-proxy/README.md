@@ -35,7 +35,17 @@ Env:
 
 ## Routing notes
 
-- **HTTP follow-up** (`POST /threads/:id/messages`): owner lookup; if none, round-robin (on-demand assign).
-- **HTTP create / list**: round-robin (any CP + shared DB).
+- **HTTP follow-up** (`POST /threads/:id/messages`): owner lookup; if none, route to a CP that has a **free** healthy VM (not blind RR).
+- **HTTP create** (`POST /threads`): same — pick a CP with free capacity from DB.
 - **VM WS**: buffer until `register`, then route by `owner_cp_id` for that `externalId` (or pick a backend; CP stamps `owner_cp_id` on register).
-- **Browser WS**: buffer until `subscribe` (or `?threadId=`), then owner lookup.
+- **Browser WS**: wait for `subscribe` (or `?threadId=`), then owner lookup. Re-subscribe can switch upstream if the thread’s owner changed. **Never** pin the socket via early round-robin (that caused the UI to hang on “agent working” while the loop ran on another CP).
+
+## Debug
+
+```bash
+curl -s http://localhost:3001/mappings | jq
+# alias:
+curl -s http://localhost:3001/debug | jq
+```
+
+Shows configured backends, `vmToOwner`, and `threadToOwner` (active assignments only) with where the proxy would route.

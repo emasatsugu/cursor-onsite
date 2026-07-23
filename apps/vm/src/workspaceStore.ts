@@ -88,11 +88,29 @@ export class GitWorkspaceStore implements WorkspaceStore {
   private readonly workspaceDir: string;
   private readonly remotePublic: string;
   private readonly log: (...args: unknown[]) => void;
+  /** Serialize all git ops on this working tree (avoids index.lock races). */
+  private gitChain: Promise<unknown> = Promise.resolve();
 
   constructor(options: GitWorkspaceStoreOptions) {
     this.workspaceDir = path.resolve(options.workspaceDir);
     this.remotePublic = options.remoteUrl ?? WORKSPACE_GIT_REMOTE;
     this.log = options.log ?? ((...args) => console.log("[vm:git]", ...args));
+  }
+
+  /**
+   * Run `fn` after any in-flight persist/restore finishes.
+   * Failures do not break the queue for later callers.
+   */
+  private enqueueGit<T>(label: string, fn: () => Promise<T>): Promise<T> {
+    const run = this.gitChain.then(() => {
+      this.log(`git queue → ${label}`);
+      return fn();
+    });
+    this.gitChain = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    return run;
   }
 
   private authRemote(): string {
@@ -115,6 +133,10 @@ export class GitWorkspaceStore implements WorkspaceStore {
   }
 
   async restore(threadId: string): Promise<void> {
+    return this.enqueueGit(`restore ${threadId}`, () => this.restoreUnlocked(threadId));
+  }
+
+  private async restoreUnlocked(threadId: string): Promise<void> {
     await this.ensureWorkspaceRepo();
     const branch = threadBranch(threadId);
     this.log(`restore thread=${threadId} branch=${branch} remote=${this.remotePublic}`);
@@ -152,6 +174,12 @@ export class GitWorkspaceStore implements WorkspaceStore {
   }
 
   async persist(threadId: string, message?: string): Promise<void> {
+    return this.enqueueGit(`persist ${threadId}`, () =>
+      this.persistUnlocked(threadId, message),
+    );
+  }
+
+  private async persistUnlocked(threadId: string, message?: string): Promise<void> {
     await this.ensureWorkspaceRepo();
     const branch = threadBranch(threadId);
     this.log(`persist thread=${threadId} branch=${branch}`);

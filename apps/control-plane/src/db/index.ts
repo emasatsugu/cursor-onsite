@@ -120,8 +120,19 @@ Transcript.belongsTo(Thread, { foreignKey: "threadId", as: "thread" });
 
 export async function initDb(options?: { force?: boolean }): Promise<void> {
   await sequelize.authenticate();
-  // alter: true so new columns (e.g. owner_cp_id) appear without a full reset.
-  await sequelize.sync(
-    options?.force ? { force: true } : { alter: true }
+  // Avoid sync({ alter: true }) — SQLite rewrite via *_backup tables is brittle.
+  await sequelize.sync(options?.force ? { force: true } : undefined);
+  await ensureOwnerCpIdColumn();
+}
+
+/** Additive migration for multi-CP ownership (safe if column already exists). */
+async function ensureOwnerCpIdColumn(): Promise<void> {
+  const [rows] = (await sequelize.query(
+    "PRAGMA table_info(`virtual_machines`)"
+  )) as [Array<{ name: string }>, unknown];
+  if (rows.some((r) => r.name === "owner_cp_id")) return;
+  await sequelize.query(
+    "ALTER TABLE `virtual_machines` ADD COLUMN `owner_cp_id` VARCHAR"
   );
 }
+

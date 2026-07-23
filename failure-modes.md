@@ -2,7 +2,7 @@
 
 Companion to `edd.md` / `implementation-edd.md`. Focus: **control plane ↔ VM**, **browser idle / reclaim**, and coupled transcript risks.
 
-**Audited against:** commits through `d59334f` (`from db working`) + current tree — DB SoT for VMs/assignments, disconnect clears sticky, `IDLE_RECLAIM_MS` default `0`.
+**Audited against:** current tree — DB SoT while CP is up; **clear all actives on boot** (no sticky across restart); disconnect clears sticky; `IDLE_RECLAIM_MS` default `0`.
 
 **Legend — Status**
 
@@ -18,8 +18,8 @@ Companion to `edd.md` / `implementation-edd.md`. Focus: **control plane ↔ VM**
 
 | Was | Now |
 |---|---|
-| Assignments in-memory only; CP restart lost stickiness (**CP-01/02 TODO**) | DB SoT (`assignment/store.ts`); hydrate on boot; VM `register` → `upsertVmHealthy` + re-send sticky `assignment` |
-| Keep sticky across VM disconnect; lazy reassign on next prompt | **Complete** assignment on disconnect / reclaim (`persistClear`); follow-up **on-demand assigns any free VM** |
+| Assignments in-memory only; CP restart lost stickiness (**CP-01/02 TODO**) | DB SoT for assignments while CP is up; **CP boot completes all actives** (no sticky across restart); follow-up on-demand assign + `restore` |
+| Keep sticky across VM disconnect; lazy reassign on next prompt | **Complete** assignment on disconnect / reclaim; follow-up **on-demand assigns any free VM** |
 | `IDLE_RECLAIM_MS` default 60s, sweeper-only | Default **0** (immediate when last sub leaves); also on `unsubscribe` / exclusive re-subscribe; sweeper as backup |
 | — | Browser `unsubscribe`; one socket → one thread (exclusive subscribe) |
 
@@ -43,14 +43,14 @@ Companion to `edd.md` / `implementation-edd.md`. Focus: **control plane ↔ VM**
 | **VM-12** | CP `persist_request` fails / 30s timeout | `waitForPersistResponse` / `ok: false` | `agent_loop_done`: log only. Reclaim: log + still `persistClear` | Loop still done; slot freed even if checkpoint failed | Invisible; next restore may be stale | **Partial** |
 | **VM-13** | Hard kill mid-edit (no persist) | — | Unpersisted tree lost | Next `restore` = last checkpoint | Lost agent edits | **Partial** (by design) |
 | **VM-14** | Parallel tools + VM dies mid-batch | Disconnect rejects waiters | `Promise.all` fails | `agent_loop_error`; may leave dangling assistant `tool_calls` in blob | Error; follow-up may break OpenAI context | **Partial** (see **T-02**) |
-| **CP-01** | CP restart mid-generation | Process gone | In-memory sockets, `runningLoops`, waiters, browser subs **gone** | Boot: `hydrateAssignmentCache` from DB. **Do not** auto-resume loops. Partial blobs remain. Sticky rows that were still `active` survive | Browser WS drops; in-flight run orphaned; user may follow-up once a VM is up | **Partial** (no mid-gen resume — intentional) |
-| **CP-02** | CP restart, then VM re-registers | VM `register` | Upsert DB healthy; attach socket | Re-send `assignment` for any hydrated sticky threads on that `externalId` → VM `restore` | Sticky threads continue on same VM after both sides are back | **Handled** |
+| **CP-01** | CP restart mid-generation | Process gone | In-memory sockets, loops, waiters, browser subs **gone** | Boot: `clearActiveAssignmentsOnBoot` (all stickies `completed`). **Do not** auto-resume loops. Partial blobs remain | Browser WS drops; in-flight run orphaned; follow-up assigns any free VM + `restore` | **Partial** (no mid-gen resume — intentional) |
+| **CP-02** | CP restart, then VM re-registers | VM `register` | Upsert DB healthy; attach socket as **free** pool member | No sticky rebind (cleared on boot). Next prompt on-demand assigns + `restore` | Works; may land on a different VM than before the bounce | **Handled** |
 | **CP-03** | Concurrent second prompt | `runningLoops.has` | — | **409** | “Generation already running” | **Handled** |
 | **CP-04** | OpenAI stream / API failure | Exception in stream | — | `agent_loop_error`; no blob rollback | Error; history at last boundary | **Handled** |
 | **CP-05** | Exceed `MAX_STEPS` (25) | Loop counter | — | `agent_loop_error` | Error event | **Handled** |
 | **CP-06** | Broadcast with 0 browser subscribers | `broadcastToThread` | Events dropped (no replay) | `GET /threads/:id` boundary-accurate only | Missed live stream | **Handled** (best-effort WS) |
 | **CP-07** | Unmatched `tool_call_response` | No waiter | Log only | Ignored | None / earlier timeout | **Handled** |
-| **CP-08** | Hydrated sticky after CP restart, no browser ever re-subscribes | Assignment stays `active` | VM slot stays reserved for that thread | No idle clock (`threadSubsEmptySince` unset). Slot frees when: VM disconnect, user follow-up scrub path, or user subs then leaves (reclaim) | One VM may stay “assigned” with no live client | **Partial** |
+| **CP-08** | Hydrated sticky after CP restart, no browser | — | — | **N/A** — boot clears actives; no orphan sticky | — | **Handled** (by clear-on-boot) |
 | **BR-01** | Browser tab close / navigate away | WS `close` → `removeBrowserSubFromAll` | Subs → 0; `threadSubsEmptySince` set | Loop keeps running if any. **`maybeReclaimThreads`** (default immediate when idle) | Return: history refresh; live mid-stream may be missing | **Handled** |
 | **BR-02** | Browser WS blip / sleep + client reconnect (~1.5s) | Close then re-open + re-`subscribe` | With `IDLE_RECLAIM_MS=0`, reclaim may run on close **before** reconnect | Set grace (e.g. `3000`) to tolerate blips. No event replay either way | Possible missed deltas; assignment may churn to another VM on next prompt | **Partial** |
 | **BR-03** | Browser idle reclaim | Last sub gone + no loop; `IDLE_RECLAIM_MS` (default **0**) | Best-effort `persist` → `unassign` → `persistClear` | VM back in pool. Next follow-up on-demand assign + `restore` | Usually invisible if persist OK | **Handled** |
@@ -108,27 +108,26 @@ Browser          CP                         VM-A              VM-B
   |              |-- assignment + restore → |                 |
 ```
 
-### 3c. CP restart (DB SoT)
+### 3c. CP restart (clear stickies)
 
 ```
   In-flight loop + sockets + waiters gone
-  SQLite: threads, blobs, active assignments survive
-  Boot → hydrateAssignmentCache
-  VM register → upsert healthy → re-send assignment for hydrated stickies → restore
-  User follow-up (no mid-gen auto-resume)
+  SQLite: threads/blobs survive; active assignments → completed on boot
+  VM register → free pool (no sticky rebind)
+  User follow-up → ensureConnectedVm → assign any free + restore
 ```
 
 ---
 
 ## 4. Priority to harden next
 
-Ordered by demo risk / user pain (post–DB SoT):
+Ordered by demo risk / user pain:
 
 1. **T-02** — repair/truncate inconsistent turn blobs after mid-tool `agent_loop_error` (follow-ups can hard-fail against OpenAI).
 2. **VM-10 / VM-11 / VM-12** — surface `restore`/`persist` failures to CP (fail loop or block reclaim/reassign) instead of log-only + free-anyway.
 3. **BR-02** — default grace for reclaim (`IDLE_RECLAIM_MS>0`) and/or UI “disconnected; refresh history” on WS reconnect during a run.
-4. **CP-08** — reclaim or TTL hydrated stickies with no subscribers after CP restart (avoid reserved-but-idle VMs).
-5. **T-03** — explicit retry/replay UX after `agent_loop_error`.
+4. **T-03** — explicit retry/replay UX after `agent_loop_error`.
+5. **Later optimization:** hydrate stickies across CP restart + same-VM rebind (optional; not needed for correctness if `persist`/`restore` work).
 
 ---
 
@@ -138,5 +137,6 @@ Ordered by demo risk / user pain (post–DB SoT):
 - Multi-CP ownership / assign locking
 - WS event replay buffer for browsers
 - Auto-resume of an in-flight agent loop after CP restart
+- Same-VM sticky rebind across CP restart (clear-on-boot; restore on next assign is enough)
 - Guaranteed durability across hard kill without a successful `persist`
 - Tool-level cancel mid-run (beyond failing the whole loop)

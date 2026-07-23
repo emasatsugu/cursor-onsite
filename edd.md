@@ -107,5 +107,6 @@ Deferred:
 - Tool-call timeouts / max loop iterations / cancel mid-run
 - Reassign thread when assigned VM goes unhealthy
 - Transcript failure modes / replay (see implementation-edd Follow-ups)
+- **Next:** split **scheduler (assignment)** from **worker (execution)**, plus broader productionalizing (store, auth, isolation, observability) — see implementation-edd **Next steps**
 
-See `implementation-edd.md` for component ownership, normative message schemas, and parallel implementation plan.
+See `implementation-edd.md` for component ownership, normative message schemas, parallel implementation plan, and next steps.

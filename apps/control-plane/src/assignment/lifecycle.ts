@@ -18,11 +18,11 @@ import {
 import { persistAssign, persistClear } from "./store.js";
 
 /**
- * Optional grace after last browser subscriber leaves before reclaim.
- * Default 0 = reclaim on demand (easier to reason about in /debug).
- * Set e.g. 3000 to tolerate brief browser WS reconnect blips.
+ * Grace after last browser subscriber leaves before reclaim.
+ * Default 30s — long enough to switch threads / survive brief WS blips without
+ * thrashing assign+restore. Set 0 for immediate reclaim (debug / demos).
  */
-export const IDLE_RECLAIM_MS = Number(process.env.IDLE_RECLAIM_MS ?? 0);
+export const IDLE_RECLAIM_MS = Number(process.env.IDLE_RECLAIM_MS ?? 30_000);
 
 /**
  * Ensure the thread has a connected sticky VM.

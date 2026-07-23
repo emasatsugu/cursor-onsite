@@ -14,12 +14,24 @@ export type BrowserSocketHandlers = {
  * Browser ↔ CP WebSocket helper.
  * Connect once, then `subscribe(threadId)` when opening a thread.
  * Prompts stay on HTTP; this socket is subscribe-only for streaming.
+ *
+ * Prefer `await subscribeReady(threadId)` after HTTP create/message so the
+ * proxy has an owner in DB and attaches to the right CP (avoids missing
+ * `agent_loop_done`).
  */
 export class BrowserSocket {
   private ws: WebSocket | null = null;
   private subscribedThreadId: string | null = null;
   private handlers: BrowserSocketHandlers;
   private intentionallyClosed = false;
+  /** Coalesce concurrent subscribeReady calls for the same thread. */
+  private inflight: { threadId: string; promise: Promise<void> } | null = null;
+  private pendingSubscribe: {
+    threadId: string;
+    resolve: () => void;
+    reject: (err: Error) => void;
+    timer: ReturnType<typeof setTimeout>;
+  } | null = null;
 
   constructor(handlers: BrowserSocketHandlers = {}) {
     this.handlers = handlers;
@@ -48,6 +60,14 @@ export class BrowserSocket {
     ws.onmessage = (event) => {
       try {
         const msg = JSON.parse(String(event.data)) as BrowserServerMessage;
+        if (msg.type === "subscribed") {
+          const pending = this.pendingSubscribe;
+          if (pending && pending.threadId === msg.threadId) {
+            clearTimeout(pending.timer);
+            this.pendingSubscribe = null;
+            pending.resolve();
+          }
+        }
         this.handlers.onMessage?.(msg);
       } catch (err) {
         console.warn("Failed to parse browser WS message", err);
@@ -61,25 +81,78 @@ export class BrowserSocket {
     ws.onclose = () => {
       this.handlers.onClose?.();
       this.ws = null;
+      if (this.pendingSubscribe) {
+        clearTimeout(this.pendingSubscribe.timer);
+        this.pendingSubscribe.reject(
+          new Error("WebSocket closed during subscribe"),
+        );
+        this.pendingSubscribe = null;
+      }
+      this.inflight = null;
       if (!this.intentionallyClosed) {
-        // Best-effort reconnect for POC demos
         window.setTimeout(() => this.connect(), 1500);
       }
     };
   }
 
+  /** Fire-and-forget subscribe (e.g. when selecting a thread in the sidebar). */
   subscribe(threadId: string): void {
-    this.subscribedThreadId = threadId;
-    if (this.ws?.readyState === WebSocket.OPEN) {
-      this.sendSubscribe(threadId);
-    } else {
-      this.connect();
+    void this.subscribeReady(threadId).catch(() => {
+      /* sidebar select — non-fatal */
+    });
+  }
+
+  /**
+   * Subscribe and wait for `subscribed` ack (from proxy and/or CP).
+   * Concurrent calls for the same threadId share one in-flight promise.
+   */
+  subscribeReady(threadId: string, timeoutMs = 8_000): Promise<void> {
+    if (this.inflight?.threadId === threadId) {
+      return this.inflight.promise;
     }
+
+    this.subscribedThreadId = threadId;
+
+    if (this.pendingSubscribe && this.pendingSubscribe.threadId !== threadId) {
+      clearTimeout(this.pendingSubscribe.timer);
+      this.pendingSubscribe.reject(new Error("subscribe superseded"));
+      this.pendingSubscribe = null;
+    }
+
+    const promise = new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        if (this.pendingSubscribe?.threadId === threadId) {
+          this.pendingSubscribe = null;
+          reject(new Error(`subscribe timeout for ${threadId}`));
+        }
+      }, timeoutMs);
+
+      this.pendingSubscribe = { threadId, resolve, reject, timer };
+
+      if (this.ws?.readyState === WebSocket.OPEN) {
+        this.sendSubscribe(threadId);
+      } else {
+        this.connect();
+      }
+    }).finally(() => {
+      if (this.inflight?.threadId === threadId) {
+        this.inflight = null;
+      }
+    });
+
+    this.inflight = { threadId, promise };
+    return promise;
   }
 
   /** Leave all thread subscriptions (e.g. draft / new-thread mode). */
   unsubscribe(): void {
     this.subscribedThreadId = null;
+    this.inflight = null;
+    if (this.pendingSubscribe) {
+      clearTimeout(this.pendingSubscribe.timer);
+      this.pendingSubscribe.reject(new Error("unsubscribed"));
+      this.pendingSubscribe = null;
+    }
     if (this.ws?.readyState === WebSocket.OPEN) {
       const msg: BrowserClientMessage = { type: "unsubscribe" };
       this.ws.send(JSON.stringify(msg));
@@ -89,6 +162,11 @@ export class BrowserSocket {
   close(): void {
     this.intentionallyClosed = true;
     this.subscribedThreadId = null;
+    this.inflight = null;
+    if (this.pendingSubscribe) {
+      clearTimeout(this.pendingSubscribe.timer);
+      this.pendingSubscribe = null;
+    }
     this.ws?.close();
     this.ws = null;
   }
