@@ -59,6 +59,9 @@ export type CreateThreadResponse = { thread: ThreadSummary };
 export type PostMessageRequest = { prompt: string };
 export type PostMessageResponse = { transcriptId: string };
 
+export type ThreadsListResponse = { threads: ThreadSummary[] };
+export type ApiError = { error: string };
+
 // --- Browser ↔ CP WS ---
 export type BrowserClientMessage = {
   type: "subscribe";
