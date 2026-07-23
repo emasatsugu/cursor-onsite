@@ -1,0 +1,14 @@
+{
+  "name": "cursor-onsite",
+  "private": true,
+  "workspaces": [
+    "packages/*",
+    "apps/*"
+  ],
+  "scripts": {
+    "build:shared": "npm run build -w @poc/shared",
+    "dev:vm": "npm run dev -w @poc/vm",
+    "test:vm": "npm run test -w @poc/vm",
+    "stub:cp": "npm run stub:cp -w @poc/vm"
+  }
+}
