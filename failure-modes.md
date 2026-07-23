@@ -1,8 +1,11 @@
 # Failure modes — VM + Control Plane (+ browser idle)
 
-Companion to `edd.md` / `implementation-edd.md`. Focus: **control plane ↔ VM**, **browser idle / reclaim**, and coupled transcript risks.
+Companion to `edd.md` / `implementation-edd.md` / `final-writeup.md`.
 
-**Audited against:** current tree — DB SoT while CP is up; **clear all actives on boot** (no sticky across restart); disconnect clears sticky; `IDLE_RECLAIM_MS` default `0`.
+**Primary spine (die timing):** see **§0** below and the matching section in `final-writeup.md`.  
+Rest of this file keeps the detailed ID catalog (capacity, persist, browser, transcripts).
+
+**Audited against:** current tree — DB SoT while CP is up; clear actives on boot; disconnect clears sticky; `IDLE_RECLAIM_MS` default **30s** (code); proxy + multi-CP.
 
 **Legend — Status**
 
@@ -11,6 +14,28 @@ Companion to `edd.md` / `implementation-edd.md`. Focus: **control plane ↔ VM**
 | **Handled** | Behavior exists in code today |
 | **Partial** | Detected or partially mitigated; gaps remain |
 | **TODO** | Spec'd or obvious, not implemented (or explicitly deferred) |
+
+---
+
+## 0. Die-timing matrix (VM × CP × loop phase)
+
+| When | Meaning |
+|---|---|
+| **Between loops** | No `runningLoops` |
+| **Mid–OpenAI** | Inside `streamChatCompletion` |
+| **Loop gap** | Loop running, not in OpenAI stream or tool waiter (post-assistant / pre-tools, post-tools / pre-next-OpenAI, end persist) |
+| **Mid–tool** | Blocked on `waitForToolCallResponse` |
+
+| When | VM dies | Owning CP dies |
+|---|---|---|
+| **Between loops** | **Sticky cleared** (assignment `completed`, cache dropped; thread+blobs kept); next prompt reassigns + restore | Boot **clears stickies** fleet-wide (shared DB); next prompt via proxy |
+| **Mid–OpenAI** | Stream **not** aborted; sticky cleared; then done/persist skip or fail at tools → `agent_loop_error`; possible **T-02** | Process gone; no error event; blob usually `[user]` only (**T-01**) |
+| **Loop gap** | Sticky cleared; loop continues until next VM need → usually `agent_loop_error`; **T-02** if tools pending in blob | Silent; blob = last boundary; **T-02** if assistant+`tool_calls` without tools |
+| **Mid–tool** | Reject waiters → `agent_loop_error`; sticky cleared; **T-02**; unpersisted edits possible | Silent; **T-02** likely; orphan tool on VM |
+
+**Sticky cleared** = tear down thread→VM binding only (`assignments` → `completed` + drop `vmByThread`). Does **not** delete the thread or transcripts; VM returns to the free pool on reconnect (no auto rebind).
+
+Full narrative cells: `final-writeup.md` → Failure modes.
 
 ---
 
@@ -51,6 +76,7 @@ Companion to `edd.md` / `implementation-edd.md`. Focus: **control plane ↔ VM**
 | **CP-06** | Broadcast with 0 browser subscribers | `broadcastToThread` | Events dropped (no replay) | `GET /threads/:id` boundary-accurate only | Missed live stream | **Handled** (best-effort WS) |
 | **CP-07** | Unmatched `tool_call_response` | No waiter | Log only | Ignored | None / earlier timeout | **Handled** |
 | **CP-08** | Hydrated sticky after CP restart, no browser | — | — | **N/A** — boot clears actives; no orphan sticky | — | **Handled** (by clear-on-boot) |
+| **PX-01** | Dead CP instance behind proxy (process down or `/debug/unhealthy`) | Health probe fail / force flag / upstream connect error | Sticky `owner_cp_id` would black-hole traffic | Scrub: complete stickies for that CP’s VMs, clear `owner_cp_id`, mark VMs unhealthy; skip dead owner; HTTP/WS **one retry** on a live CP | Follow-up/create/VM register land on live CP; mid-gen on dead CP still orphaned (no resume) | **Handled** |
 | **BR-01** | Browser tab close / navigate away | WS `close` → `removeBrowserSubFromAll` | Subs → 0; `threadSubsEmptySince` set | Loop keeps running if any. **`maybeReclaimThreads`** (default immediate when idle) | Return: history refresh; live mid-stream may be missing | **Handled** |
 | **BR-02** | Browser WS blip / sleep + client reconnect (~1.5s) | Close then re-open + re-`subscribe` | With `IDLE_RECLAIM_MS=0`, reclaim may run on close **before** reconnect | Set grace (e.g. `3000`) to tolerate blips. No event replay either way | Possible missed deltas; assignment may churn to another VM on next prompt | **Partial** |
 | **BR-03** | Browser idle reclaim | Last sub gone + no loop; `IDLE_RECLAIM_MS` (default **0**) | Best-effort `persist` → `unassign` → `persistClear` | VM back in pool. Next follow-up on-demand assign + `restore` | Usually invisible if persist OK | **Handled** |
