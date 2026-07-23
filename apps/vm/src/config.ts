@@ -7,6 +7,8 @@ export type VmConfig = {
   controlPlaneWsUrl: string;
   workspaceDir: string;
   heartbeatIntervalMs: number;
+  /** Local HTTP port for debug endpoints (0 = disabled). */
+  debugPort: number;
 };
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): VmConfig {
@@ -18,5 +20,6 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): VmConfig {
     controlPlaneWsUrl: env.CONTROL_PLANE_WS_URL ?? "ws://localhost:3001/ws/vm",
     workspaceDir,
     heartbeatIntervalMs: Number(env.HEARTBEAT_INTERVAL_MS ?? "5000"),
+    debugPort: Number(env.DEBUG_PORT ?? "3002"),
   };
 }

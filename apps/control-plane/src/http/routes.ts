@@ -16,13 +16,14 @@ import {
   Transcript,
   VirtualMachine,
 } from "../db/index.js";
-import { runningLoops, vmByThread, vmSockets } from "../memory/state.js";
+import { browserSubs, runningLoops, vmByThread, vmSockets } from "../memory/state.js";
 import {
   createTranscriptWithUserPrompt,
   findHealthyUnassignedVm,
   runAgentLoop,
 } from "../agent/loop.js";
 import { sendAssignment } from "../ws/vm.js";
+import { cpLog } from "../debug/log.js";
 
 const DEMO_USER_ID = process.env.DEMO_USER_ID ?? "demo-user";
 
@@ -39,6 +40,78 @@ export function createHttpRouter(): Router {
 
   router.get("/health", (_req, res) => {
     res.json({ ok: true });
+  });
+
+  /**
+   * Debug: in-memory VM pool + DB assignments + browser subscriptions.
+   * GET /debug/state
+   */
+  router.get("/debug/state", async (_req: Request, res: Response) => {
+    try {
+      const dbVms = await VirtualMachine.findAll({ order: [["createdAt", "ASC"]] });
+      const assignments = await Assignment.findAll({
+        order: [["createdAt", "ASC"]],
+      });
+
+      const assignedVmIds = new Set(
+        assignments.filter((a) => a.status === "active").map((a) => a.vmId)
+      );
+
+      const pool = dbVms.map((vm) => {
+        const connected = vmSockets.has(vm.externalId);
+        const assigned = assignedVmIds.has(vm.id);
+        const threadIds = [...vmByThread.entries()]
+          .filter(([, ext]) => ext === vm.externalId)
+          .map(([threadId]) => threadId);
+        return {
+          id: vm.id,
+          externalId: vm.externalId,
+          status: vm.status,
+          connected,
+          assigned,
+          threadIds,
+          availableForNewThread: connected && vm.status === "healthy" && !assigned,
+        };
+      });
+
+      const assignmentRows = await Promise.all(
+        assignments.map(async (a) => {
+          const vm = dbVms.find((v) => v.id === a.vmId);
+          return {
+            id: a.id,
+            threadId: a.threadId,
+            vmId: a.vmId,
+            vmExternalId: vm?.externalId ?? null,
+            status: a.status,
+            createdAt: a.createdAt.toISOString(),
+            loopRunning: runningLoops.has(a.threadId),
+            browserSubscribers: browserSubs.get(a.threadId)?.size ?? 0,
+          };
+        })
+      );
+
+      const connectedExternalIds = [...vmSockets.keys()];
+      const orphanSockets = connectedExternalIds.filter(
+        (ext) => !dbVms.some((v) => v.externalId === ext)
+      );
+
+      res.json({
+        pool,
+        assignments: assignmentRows,
+        inMemory: {
+          connectedExternalIds,
+          orphanSockets,
+          vmByThread: Object.fromEntries(vmByThread),
+          runningLoops: [...runningLoops],
+          browserSubs: Object.fromEntries(
+            [...browserSubs.entries()].map(([threadId, set]) => [threadId, set.size])
+          ),
+        },
+      });
+    } catch (err) {
+      console.error(err);
+      res.status(500).json({ error: "Failed to load debug state" });
+    }
   });
 
   router.get("/threads", async (_req: Request, res: Response) => {
@@ -114,11 +187,17 @@ export function createHttpRouter(): Router {
         status: "active",
       });
       vmByThread.set(thread.id, vm.externalId);
+      cpLog(
+        `new assignment thread=${thread.id} → VM ${vm.externalId} (${vm.id})`
+      );
       sendAssignment(vm.externalId, thread.id);
 
       const { transcriptId, key } = await createTranscriptWithUserPrompt(
         thread.id,
         body.prompt
+      );
+      cpLog(
+        `POST /threads promptLen=${body.prompt.length} thread=${thread.id} transcript=${transcriptId}`
       );
 
       if (runningLoops.has(thread.id)) {
@@ -167,10 +246,16 @@ export function createHttpRouter(): Router {
         return;
       }
       vmByThread.set(threadId, vm.externalId);
+      cpLog(
+        `follow-up on sticky assignment thread=${threadId} → VM ${vm.externalId}`
+      );
 
       const { transcriptId, key } = await createTranscriptWithUserPrompt(
         threadId,
         body.prompt
+      );
+      cpLog(
+        `POST /threads/${threadId}/messages promptLen=${body.prompt.length} transcript=${transcriptId}`
       );
 
       runningLoops.add(threadId);

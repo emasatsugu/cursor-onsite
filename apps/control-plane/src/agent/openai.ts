@@ -2,6 +2,7 @@ import OpenAI from "openai";
 import type { ChatCompletionMessageParam } from "openai/resources/chat/completions";
 import { OPENAI_TOOLS, SYSTEM_PROMPT } from "@poc/shared";
 import type { ToolName } from "@poc/shared";
+import { shouldUseMockOpenAI } from "../env.js";
 
 export type StreamedToolCall = {
   id: string;
@@ -13,8 +14,6 @@ export type StreamTurnResult = {
   content: string | null;
   toolCalls: StreamedToolCall[];
 };
-
-const useMock = process.env.MOCK_OPENAI === "1" || !process.env.OPENAI_API_KEY;
 
 let openai: OpenAI | null = null;
 function getClient(): OpenAI {
@@ -66,7 +65,7 @@ export async function streamChatCompletion(
   messages: ChatCompletionMessageParam[],
   onTextDelta: OnTextDelta
 ): Promise<StreamTurnResult> {
-  if (useMock) {
+  if (shouldUseMockOpenAI()) {
     return mockStreamCompletion(messages, onTextDelta);
   }
 

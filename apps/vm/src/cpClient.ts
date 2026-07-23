@@ -4,6 +4,16 @@ import type { VmClientMessage, VmServerMessage } from "@poc/shared";
 import type { VmConfig } from "./config.js";
 import { executeTool } from "./tools/execute.js";
 
+function preview(value: unknown, max = 200): string {
+  try {
+    const s = JSON.stringify(value);
+    if (s.length <= max) return s;
+    return `${s.slice(0, max)}…`;
+  } catch {
+    return String(value);
+  }
+}
+
 export type CpClientOptions = VmConfig & {
   externalId?: string;
   /** Optional logger; defaults to console. */
@@ -19,11 +29,12 @@ export class ControlPlaneClient {
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private stopped = false;
   private currentThreadId: string | null = null;
+  private heartbeatCount = 0;
 
   constructor(options: CpClientOptions) {
     this.config = options;
     this.externalId = options.externalId ?? randomUUID();
-    this.log = options.log ?? ((...args) => console.log("[vm]", ...args));
+    this.log = options.log ?? ((...args) => console.log("[vm:debug]", ...args));
   }
 
   get threadId(): string | null {
@@ -79,6 +90,7 @@ export class ControlPlaneClient {
 
   private scheduleReconnect(): void {
     if (this.stopped || this.reconnectTimer) return;
+    this.log("scheduling reconnect in 2000ms");
     this.reconnectTimer = setTimeout(() => {
       this.reconnectTimer = null;
       this.connect();
@@ -87,7 +99,9 @@ export class ControlPlaneClient {
 
   private startHeartbeat(): void {
     this.clearHeartbeat();
+    this.heartbeatCount = 0;
     this.heartbeatTimer = setInterval(() => {
+      this.heartbeatCount += 1;
       this.send({ type: "heartbeat", externalId: this.externalId });
     }, this.config.heartbeatIntervalMs);
   }
@@ -101,8 +115,13 @@ export class ControlPlaneClient {
 
   private send(msg: VmClientMessage): void {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
-      this.log("cannot send; socket not open:", msg.type);
+      this.log("→ CP DROPPED (socket not open):", msg.type);
       return;
+    }
+    if (msg.type === "heartbeat") {
+      this.log(`→ CP heartbeat #${this.heartbeatCount} externalId=${msg.externalId}`);
+    } else {
+      this.log(`→ CP ${msg.type}`, preview(msg));
     }
     this.ws.send(JSON.stringify(msg));
   }
@@ -112,21 +131,23 @@ export class ControlPlaneClient {
     try {
       msg = JSON.parse(raw) as VmServerMessage;
     } catch {
-      this.log("invalid JSON from CP:", raw);
+      this.log("← CP invalid JSON:", raw.slice(0, 200));
       return;
     }
 
+    this.log(`← CP ${msg.type}`, preview(msg));
+
     if (msg.type === "assignment") {
       this.currentThreadId = msg.threadId;
-      this.log(`assignment received for thread ${msg.threadId}`);
+      this.log(`assignment stored threadId=${msg.threadId}`);
       return;
     }
 
     if (msg.type === "execute_tool_call") {
       this.log(
-        `execute_tool_call ${msg.toolCallId} name=${msg.name}`,
+        `executing tool ${msg.name} toolCallId=${msg.toolCallId}`,
+        preview(msg.arguments),
       );
-      // Parallel tool calls each get their own response with matching toolCallId.
       const { ok, result } = await executeTool(
         this.config.workspaceDir,
         msg.name,
@@ -138,10 +159,10 @@ export class ControlPlaneClient {
         ok,
         result,
       });
-      this.log(`tool_call_response ${msg.toolCallId} ok=${ok}`);
+      this.log(`tool finished toolCallId=${msg.toolCallId} ok=${ok}`, preview(result));
       return;
     }
 
-    this.log("unknown message from CP:", raw);
+    this.log("← CP unknown message type:", raw.slice(0, 200));
   }
 }

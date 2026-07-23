@@ -9,17 +9,32 @@ import {
   pendingToolCalls,
   runningLoops,
 } from "../memory/state.js";
+import { cpLog, debugPreview } from "../debug/log.js";
 
-function sendVm(ws: WebSocket, message: VmServerMessage): void {
+function sendVm(ws: WebSocket, message: VmServerMessage, externalId?: string): void {
   if (ws.readyState === WebSocket.OPEN) {
+    cpLog(
+      `→ VM${externalId ? ` ${externalId}` : ""}`,
+      message.type,
+      debugPreview(message)
+    );
     ws.send(JSON.stringify(message));
+  } else {
+    cpLog(
+      `→ VM${externalId ? ` ${externalId}` : ""} DROPPED (socket not open)`,
+      message.type
+    );
   }
 }
 
 export function sendAssignment(externalId: string, threadId: string): boolean {
   const ws = vmSockets.get(externalId);
-  if (!ws) return false;
-  sendVm(ws, { type: "assignment", threadId });
+  if (!ws) {
+    cpLog(`assignment FAILED — no socket for VM ${externalId} thread=${threadId}`);
+    return false;
+  }
+  cpLog(`assignment thread=${threadId} → VM ${externalId}`);
+  sendVm(ws, { type: "assignment", threadId }, externalId);
   return true;
 }
 
@@ -28,8 +43,13 @@ export function sendExecuteToolCall(
   payload: Extract<VmServerMessage, { type: "execute_tool_call" }>
 ): boolean {
   const ws = vmSockets.get(externalId);
-  if (!ws) return false;
-  sendVm(ws, payload);
+  if (!ws) {
+    cpLog(
+      `execute_tool_call FAILED — no socket for VM ${externalId} toolCallId=${payload.toolCallId}`
+    );
+    return false;
+  }
+  sendVm(ws, payload, externalId);
   return true;
 }
 
@@ -57,14 +77,15 @@ export function waitForToolCallResponse(
 }
 
 async function handleDisconnect(externalId: string): Promise<void> {
+  cpLog(`VM disconnected ${externalId}`);
   vmSockets.delete(externalId);
   try {
     const vm = await VirtualMachine.findOne({ where: { externalId } });
     if (vm) {
       await vm.update({ status: "unhealthy" });
+      cpLog(`VM ${externalId} marked unhealthy`);
     }
 
-    // Fail in-flight tool calls + notify browsers for threads on this VM
     for (const [threadId, ext] of [...vmByThread.entries()]) {
       if (ext !== externalId) continue;
       if (!runningLoops.has(threadId)) continue;
@@ -75,7 +96,6 @@ async function handleDisconnect(externalId: string): Promise<void> {
         );
         pendingToolCalls.delete(toolCallId);
       }
-      // agent_loop_error will also be emitted from runAgentLoop catch; avoid double-send here
     }
   } catch (err) {
     console.error("handleDisconnect error", err);
@@ -87,12 +107,14 @@ export function createVmWss(): WebSocketServer {
 
   wss.on("connection", (ws: WebSocket, _req: IncomingMessage) => {
     let externalId: string | null = null;
+    cpLog("VM socket connected (awaiting register)");
 
     ws.on("message", async (data) => {
       let msg: VmClientMessage;
       try {
         msg = JSON.parse(data.toString()) as VmClientMessage;
       } catch {
+        cpLog("← VM invalid JSON", data.toString().slice(0, 200));
         return;
       }
 
@@ -107,7 +129,7 @@ export function createVmWss(): WebSocketServer {
           if (vm.status !== "healthy") {
             await vm.update({ status: "healthy" });
           }
-          console.log(`[vm] registered ${externalId}`);
+          cpLog(`← VM register ${externalId} (pool size=${vmSockets.size})`);
           return;
         }
 
@@ -121,17 +143,26 @@ export function createVmWss(): WebSocketServer {
           if (vm && vm.status !== "healthy") {
             await vm.update({ status: "healthy" });
           }
+          cpLog(`← VM heartbeat ${id}`);
           return;
         }
 
         if (msg.type === "tool_call_response") {
+          cpLog(
+            `← VM tool_call_response ${msg.toolCallId} ok=${msg.ok}`,
+            debugPreview(msg.result)
+          );
           const waiter = pendingToolCalls.get(msg.toolCallId);
           if (waiter) {
             pendingToolCalls.delete(msg.toolCallId);
             waiter.resolve({ ok: msg.ok, result: msg.result });
+          } else {
+            cpLog(`← VM tool_call_response unmatched toolCallId=${msg.toolCallId}`);
           }
           return;
         }
+
+        cpLog("← VM unknown message", debugPreview(msg));
       } catch (err) {
         console.error("[vm] message handler error", err);
       }
@@ -140,6 +171,8 @@ export function createVmWss(): WebSocketServer {
     ws.on("close", () => {
       if (externalId) {
         void handleDisconnect(externalId);
+      } else {
+        cpLog("VM socket closed before register");
       }
     });
   });
