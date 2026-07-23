@@ -4,10 +4,13 @@
   "version": "0.0.1",
   "type": "module",
   "scripts": {
+    "predev": "npm run build -w @poc/shared",
     "dev": "vite",
+    "prebuild": "npm run build -w @poc/shared",
     "build": "tsc -b && vite build",
     "lint": "oxlint",
     "preview": "vite preview",
+    "prestub": "npm run build -w @poc/shared",
     "stub": "tsx stub/server.ts"
   },
   "dependencies": {

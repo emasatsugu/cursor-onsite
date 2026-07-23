@@ -6,10 +6,12 @@ React + Vite UI for the cloud VM file-editing agent POC.
 
 ```bash
 # from repo root
-npm install
-npm run stub        # terminal 1 — mocks CP on :3001
-npm run dev:web     # terminal 2 — Vite on :5173
+npm install          # also builds @poc/shared → dist/ (required)
+npm run stub         # terminal 1 — mocks CP on :3001
+npm run dev:web      # terminal 2 — Vite on :5173
 ```
+
+`@poc/shared` exports compiled `dist/` (Component B). Web/CP/VM scripts build it first if needed.
 
 ## Acceptance checks (stub)
 

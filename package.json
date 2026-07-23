@@ -6,16 +6,17 @@
     "apps/*"
   ],
   "scripts": {
+    "postinstall": "npm run build:shared",
     "build:shared": "npm run build -w @poc/shared",
-    "dev:cp": "npm run dev -w @poc/control-plane",
-    "start:cp": "npm run start -w @poc/control-plane",
-    "dev:web": "npm run dev -w @poc/web",
-    "stub": "npm run stub -w @poc/web",
-    "dev:stub": "npm run stub -w @poc/web",
-    "build:web": "npm run build -w @poc/web",
-    "dev:vm": "npm run dev -w @poc/vm",
-    "start:vm": "npm run start -w @poc/vm",
-    "test:vm": "npm run test -w @poc/vm",
+    "dev:cp": "npm run build:shared && npm run dev -w @poc/control-plane",
+    "start:cp": "npm run build:shared && npm run start -w @poc/control-plane",
+    "dev:web": "npm run build:shared && npm run dev -w @poc/web",
+    "stub": "npm run build:shared && npm run stub -w @poc/web",
+    "dev:stub": "npm run stub",
+    "build:web": "npm run build:shared && npm run build -w @poc/web",
+    "dev:vm": "npm run build:shared && npm run dev -w @poc/vm",
+    "start:vm": "npm run build:shared && npm run start -w @poc/vm",
+    "test:vm": "npm run build:shared && npm run test -w @poc/vm",
     "stub:cp": "npm run stub:cp -w @poc/vm"
   }
 }
