@@ -2,16 +2,28 @@ import type http from "node:http";
 import { loadConfig } from "./config.js";
 import { ControlPlaneClient } from "./cpClient.js";
 import { startDebugServer } from "./debugServer.js";
+import { GitWorkspaceStore } from "./workspaceStore.js";
 
 const config = loadConfig();
-const client = new ControlPlaneClient(config);
+const workspaceStore = new GitWorkspaceStore({
+  workspaceDir: config.workspaceDir,
+  remoteUrl: config.gitRemote,
+});
+
+const client = new ControlPlaneClient({
+  ...config,
+  externalId: config.externalId,
+  workspaceStore,
+});
 
 console.log("[vm] starting", {
   controlPlaneWsUrl: config.controlPlaneWsUrl,
   workspaceDir: config.workspaceDir,
   heartbeatIntervalMs: config.heartbeatIntervalMs,
   debugPort: config.debugPort,
-  externalId: client.externalId,
+  externalId: config.externalId,
+  gitRemote: config.gitRemote,
+  githubToken: process.env.GITHUB_TOKEN ? "set" : "MISSING (push will fail)",
 });
 
 client.start();

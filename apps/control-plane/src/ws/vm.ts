@@ -156,6 +156,12 @@ export function createVmWss(): WebSocketServer {
           externalId = msg.externalId;
           registerVm(externalId, ws);
           cpLog(`← VM register ${externalId} (pool size=${vmSockets.size})`);
+          // Re-bind sticky threads after VM reconnect (assignment is otherwise only
+          // sent once at thread create).
+          for (const threadId of threadIdsForVm(externalId)) {
+            cpLog(`re-send assignment thread=${threadId} → VM ${externalId}`);
+            sendVm(ws, { type: "assignment", threadId }, externalId);
+          }
           return;
         }
 

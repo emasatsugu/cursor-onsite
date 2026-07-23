@@ -1,8 +1,8 @@
-import { randomUUID } from "node:crypto";
 import WebSocket from "ws";
 import type { VmClientMessage, VmServerMessage } from "@poc/shared";
 import type { VmConfig } from "./config.js";
 import { executeTool } from "./tools/execute.js";
+import type { WorkspaceStore } from "./workspaceStore.js";
 
 function preview(value: unknown, max = 200): string {
   try {
@@ -16,6 +16,7 @@ function preview(value: unknown, max = 200): string {
 
 export type CpClientOptions = VmConfig & {
   externalId?: string;
+  workspaceStore?: WorkspaceStore;
   /** Optional logger; defaults to console. */
   log?: (...args: unknown[]) => void;
 };
@@ -33,6 +34,7 @@ export type VmClientDebugStatus = {
 export class ControlPlaneClient {
   readonly externalId: string;
   private readonly config: VmConfig;
+  private readonly workspaceStore: WorkspaceStore | null;
   private readonly log: (...args: unknown[]) => void;
   private ws: WebSocket | null = null;
   private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
@@ -47,7 +49,11 @@ export class ControlPlaneClient {
 
   constructor(options: CpClientOptions) {
     this.config = options;
-    this.externalId = options.externalId ?? randomUUID();
+    if (!options.externalId?.trim()) {
+      throw new Error("externalId is required");
+    }
+    this.externalId = options.externalId.trim();
+    this.workspaceStore = options.workspaceStore ?? null;
     this.log = options.log ?? ((...args) => console.log("[vm:debug]", ...args));
   }
 
@@ -67,12 +73,50 @@ export class ControlPlaneClient {
     };
   }
 
+  async persistWorkspace(message?: string): Promise<void> {
+    if (!this.workspaceStore) {
+      throw new Error("workspace store not configured");
+    }
+    if (!this.currentThreadId) {
+      throw new Error("no thread assigned — cannot persist");
+    }
+    await this.workspaceStore.persist(this.currentThreadId, message);
+  }
+
+  async restoreWorkspace(threadId?: string): Promise<void> {
+    if (!this.workspaceStore) {
+      throw new Error("workspace store not configured");
+    }
+    const id = threadId ?? this.currentThreadId;
+    if (!id) {
+      throw new Error("threadId required — none assigned");
+    }
+    await this.workspaceStore.restore(id);
+    this.currentThreadId = id;
+  }
+
   /**
    * Simulate unhealthy: stop heartbeats and suppress reconnect.
    * If `disconnect` is true, close the WS immediately; otherwise leave it open
    * so the control plane can observe a heartbeat timeout.
+   * If `persist` is true (default), checkpoint the workspace first.
    */
-  simulateUnhealthy(options?: { disconnect?: boolean }): VmClientDebugStatus {
+  async simulateUnhealthy(options?: {
+    disconnect?: boolean;
+    persist?: boolean;
+  }): Promise<VmClientDebugStatus> {
+    const shouldPersist = options?.persist !== false;
+    if (shouldPersist && this.workspaceStore && this.currentThreadId) {
+      try {
+        await this.workspaceStore.persist(
+          this.currentThreadId,
+          "persist before unhealthy",
+        );
+      } catch (err) {
+        this.log("persist before unhealthy failed:", err);
+      }
+    }
+
     this.heartbeatsEnabled = false;
     this.reconnectEnabled = false;
     this.clearHeartbeat();
@@ -81,7 +125,7 @@ export class ControlPlaneClient {
       this.reconnectTimer = null;
     }
     this.log(
-      `simulate unhealthy (disconnect=${Boolean(options?.disconnect)})`
+      `simulate unhealthy (disconnect=${Boolean(options?.disconnect)})`,
     );
     if (options?.disconnect && this.ws) {
       this.ws.close();
@@ -90,9 +134,6 @@ export class ControlPlaneClient {
     return this.getDebugStatus();
   }
 
-  /**
-   * Simulate healthy: resume heartbeats + reconnect; connect if currently down.
-   */
   simulateHealthy(): VmClientDebugStatus {
     this.heartbeatsEnabled = true;
     this.reconnectEnabled = true;
@@ -210,6 +251,13 @@ export class ControlPlaneClient {
     if (msg.type === "assignment") {
       this.currentThreadId = msg.threadId;
       this.log(`assignment stored threadId=${msg.threadId}`);
+      if (this.workspaceStore) {
+        try {
+          await this.workspaceStore.restore(msg.threadId);
+        } catch (err) {
+          this.log("restore on assignment failed:", err);
+        }
+      }
       return;
     }
 
@@ -218,6 +266,23 @@ export class ControlPlaneClient {
         `executing tool ${msg.name} toolCallId=${msg.toolCallId}`,
         preview(msg.arguments),
       );
+
+      // Tool calls carry threadId so persist works even if we missed `assignment`
+      // (VM restart, follow-up without re-assign, etc.).
+      if (msg.threadId && msg.threadId !== this.currentThreadId) {
+        this.currentThreadId = msg.threadId;
+        this.log(`threadId from tool call → ${msg.threadId}`);
+        if (this.workspaceStore) {
+          try {
+            await this.workspaceStore.restore(msg.threadId);
+          } catch (err) {
+            this.log("restore from tool-call threadId failed:", err);
+          }
+        }
+      } else if (msg.threadId) {
+        this.currentThreadId = msg.threadId;
+      }
+
       const { ok, result } = await executeTool(
         this.config.workspaceDir,
         msg.name,
@@ -230,6 +295,32 @@ export class ControlPlaneClient {
         result,
       });
       this.log(`tool finished toolCallId=${msg.toolCallId} ok=${ok}`, preview(result));
+
+      // After mutating tools, checkpoint thread branch on the shared remote.
+      const mutating =
+        msg.name === "write_file" ||
+        msg.name === "edit_file" ||
+        msg.name === "shell";
+      if (!mutating) {
+        this.log(`skip persist — tool ${msg.name} is non-mutating`);
+      } else if (!ok) {
+        this.log(`skip persist — tool ${msg.name} failed`);
+      } else if (!this.workspaceStore) {
+        this.log("skip persist — no workspace store configured");
+      } else if (!this.currentThreadId) {
+        this.log("skip persist — no thread assigned yet");
+      } else {
+        this.log(`persist starting after ${msg.name} thread=${this.currentThreadId}`);
+        try {
+          await this.workspaceStore.persist(
+            this.currentThreadId,
+            `tool ${msg.name} ${msg.toolCallId}`,
+          );
+          this.log(`persist finished after ${msg.name}`);
+        } catch (err) {
+          this.log("persist after mutating tool failed:", err);
+        }
+      }
       return;
     }
 

@@ -177,6 +177,7 @@ export async function runAgentLoop(
           }
           const sent = sendExecuteToolCall(externalId, {
             type: "execute_tool_call",
+            threadId,
             toolCallId: tc.id,
             name: tc.name as ToolName,
             arguments: args,

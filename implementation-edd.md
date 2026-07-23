@@ -213,7 +213,7 @@ Errors: JSON `{ error: string }` with 4xx/5xx. Important cases:
 - `503` on `POST /threads` if no healthy unassigned VM
 - `409` if a generation is already running for that thread (POC: reject concurrent prompts)
 - `404` unknown thread
-- `503` on follow-up if sticky VM not connected (do not reassign)
+- Follow-up when sticky VM is down: prefer same-VM wait / reconnect; else **lazy reassign** if another VM is free — see **Single-CP durability & reassignment** below. `503` only if no recovery path (sticky down and no free VM).
 
 CORS: allow `http://localhost:5173`.
 
@@ -229,14 +229,16 @@ CORS: allow `http://localhost:5173`.
 - Emit `tool_call_start` **once** per tool call when args are fully buffered (before or when dispatching to VM).
 - Emit `tool_call_result` when VM responds (parallel tools → multiple results, order not guaranteed).
 - Always end a run with exactly one of `agent_loop_done` | `agent_loop_error`.
+- Transcript blob persistence is **not** tied to every WS event — see **Transcript blob write contract** below.
 
 ### VM WebSocket — `ws://localhost:3001/ws/vm`
 
-1. VM connects and immediately sends `register`.
-2. CP upserts `VirtualMachine` by `externalId`, marks `healthy`, stores WS handle in memory.
-3. VM sends `heartbeat` every `HEARTBEAT_INTERVAL_MS`. CP may mark unhealthy if heartbeat missed twice (optional for POC; disconnect ⇒ unhealthy + available for new assignments only if not assigned — **assigned VM disconnect: leave assignment active, fail in-flight tool calls / loop with `agent_loop_error`**).
-4. On thread create, CP sends `assignment` to the chosen VM.
+1. VM connects and immediately sends `register` (stable `VM_EXTERNAL_ID`).
+2. CP upserts `VirtualMachine` by `externalId`, marks `healthy`, stores WS handle in memory. If this VM has an active `Assignment`, CP re-sends `assignment` so the VM `restore`s that thread’s workspace.
+3. VM sends `heartbeat` every `HEARTBEAT_INTERVAL_MS`. Missed heartbeat window or WS close ⇒ mark `unhealthy`, drop socket; **keep** assignment (sticky intent). Fail in-flight tool calls / loop with `agent_loop_error`.
+4. On thread create, CP persists `Assignment`, sends `assignment` to the chosen VM (VM `restore`s).
 5. During loop, CP sends `execute_tool_call` (parallel allowed). VM replies with matching `tool_call_response`.
+6. Reassignment / CP restart behavior: see **Single-CP durability & reassignment**.
 
 ### Tool execution semantics (VM)
 
@@ -288,6 +290,20 @@ Tables:
 - `runningLoops: Set<threadId>`
 - `vmByThread: Map<threadId, externalId>` (denormalized from Assignment for speed)
 
+### Transcript blob write contract (authoritative)
+
+One turn blob = ordered OpenAI messages you’d resend for that turn only (`user` / `assistant` / `tool`). No system prompt, tool defs, WS envelopes, or partial deltas.
+
+| Event | Persist? | Blob after write |
+|---|---|---|
+| Accept prompt / create transcript | **Yes** | `[{ role:"user", content }]` |
+| Text delta / `tool_call_start` | No (WS only) | — |
+| Model stream ends | **Yes** (full overwrite) | `… + assistant` (full text + complete `tool_calls` if any) |
+| All tool results for that step return | **Yes** (full overwrite) | `… + tool` messages (`content = JSON.stringify(result)`) |
+| `agent_loop_done` / `agent_loop_error` | No extra write | Leave blob as last successful boundary write |
+
+Live UI comes from WS; `GET /threads/:id` is boundary-accurate (refresh mid-stream will not show partial assistant text).
+
 ### Agent loop algorithm (CP — authoritative)
 
 ```
@@ -301,7 +317,7 @@ onStartTurn(threadId, prompt):
       messages = [system, ...concat all turn blobs for thread in order...]
       stream chat.completions({ model, messages, tools, stream: true })
       accumulate assistant text + tool_calls from deltas
-      on text delta: broadcast assistant_message; periodically persist blob overwrite
+      on text delta: broadcast assistant_message only (do not persist)
       when stream ends:
         append assistant message (with tool_calls if any) to current turn blob; overwrite blob
         if no tool_calls:
@@ -310,10 +326,10 @@ onStartTurn(threadId, prompt):
         Promise.all(tool_calls.map(tc => send execute_tool_call to sticky VM and wait for tool_call_response))
         for each result:
           broadcast tool_call_result
-          append { role:"tool", tool_call_id, content: JSON.stringify(result) } to blob; overwrite
+        append all tool messages to blob; overwrite once
         // loop again with updated messages
   catch err:
-    broadcast agent_loop_error
+    broadcast agent_loop_error  // no blob truncate/rollback in POC
   finally:
     runningLoops.delete(threadId)
 ```
@@ -519,10 +535,10 @@ Same as above but `POST /threads/:id/messages`, skip VM picker / `assignment` (a
 
 ## Explicit non-goals (all agents)
 
-- Horizontal scale / load balancer
+- Horizontal scale / load balancer / multi-CP (layer later; see durability section)
 - Auth / multi-user
-- Git clone/commit on VM
-- Resume after CP restart
+- GitHub-backed remotes (local bare-git `WorkspaceStore` only)
+- Auto-resume of an in-flight agent **loop** after CP restart (assignments + transcripts survive; mid-generation does not)
 - Exact pixel-perfect UI
 - Token-accurate cost accounting
 
@@ -530,8 +546,97 @@ Same as above but `POST /threads/:id/messages`, skip VM picker / `assignment` (a
 
 ## Follow-ups / TODOs (post-POC)
 
-- **Reassign thread to a new VM when the sticky VM dies** — today follow-ups 503 with “Sticky VM not connected”. Needs workspace lifecycle (git clone / sync / snapshot restore) so a new VM can pick up the same files; then CP can clear the old assignment and pick an available VM.
-- Persist VM pool + assignments again (DB or Redis) when scaling to multiple control-plane instances + sticky routing.
-- Resume / recover in-flight agent loops after CP restart.
-- Tool-call timeouts, max iterations UX, and cancel mid-run from the browser.
-- Optional: allow the same VM `externalId` to survive process restart (stable id) so sticky assignment can reconnect without full reassignment.
+- ~~Deterministic / stable VM `externalId` across restarts~~ (done: required `VM_EXTERNAL_ID` env)
+- ~~Workspace / git lifecycle on the VM~~ (done: shared GitHub repo; `threadId === branch`; persist after mutating tools; restore on assignment)
+- **Maybe support branch:thread 1:many** — today branch ↔ thread is 1:1 (`threadId` is the branch name). Later: multiple threads could share one branch, or one thread could map to a chosen branch name.
+- Wire single-CP DB SoT for `virtual_machines` + `assignments` + lazy reassignment per **Single-CP durability & reassignment** (below).
+- CP→VM `persist` (or equivalent) at `agent_loop_done` so checkpoints exist without relying only on per-tool pushes / `/debug/unhealthy`.
+- Free VMs after client inactivity (release sticky assignment back to the pool) — `persist` before release; `restore` on next assignment (possibly different VM).
+- Multi-CP: shared DB/Redis for pool + assignments, sticky routing to the CP that holds the VM socket, assign locking.- **How to handle replaying a user prompt** — e.g. retry after `agent_loop_error`, regenerate from an earlier turn, or resubmit the same prompt: decide whether to overwrite vs append a new Transcript, how much of the turn blob to keep/discard, and whether workspace side effects from the failed/partial run need rollback.
+- **Partial-turn blob after crash / error** — today we leave the blob at the last message boundary. Spec failure handling for: (a) crash mid-stream (blob may be only `[user]`); (b) crash after assistant+`tool_calls` write but before all `tool` results (dangling tool_calls → invalid Chat Completions context on next load); (c) on `agent_loop_error`, leave-as-is vs truncate to last consistent prefix (e.g. strip dangling assistant tool_calls, or reset to `[user]`).
+- **Consistent context on read** — if a turn blob is mid-tools / inconsistent, either repair on `loadAllTurnMessages` or refuse to continue the thread until replay/truncate resolves it.
+
+---
+
+## Single-CP durability & reassignment (decisions)
+
+Scope: **one control-plane process**. Multi-CP ownership / locking is explicitly later. Sockets, `runningLoops`, browser subs, and pending tool waiters stay in memory always.
+
+### Source of truth
+
+| Fact | Where |
+|---|---|
+| Thread, transcripts, blobs | DB (already) |
+| VM identity + last known health (`healthy` / `unhealthy`) | DB `virtual_machines` |
+| Sticky thread → VM | DB `assignments` (SoT); `vmByThread` is a cache |
+| Live WS, `lastSeenAt`, connectedness | Memory only |
+
+**Stable VM id:** required env `VM_EXTERNAL_ID` (e.g. `vm-a`). Reconnects after kill/restart reuse the same id so DB rows stay meaningful.
+
+**Invariants:**
+- One **active** assignment per thread (`threadId` unique).
+- One **active** assignment per VM (enforce in queries / unique partial index when wiring DB).
+- New threads (`POST /threads`) only to VMs that are `healthy` **and** connected **and** have no active assignment.
+- Unhealthy or disconnected VMs never receive *new* threads; they may still be the sticky target until reconnect or reassign.
+
+### Workspace durability (prerequisite for moving threads)
+
+- `WorkspaceStore`: `persist(threadId)` / `restore(threadId)` via local bare git (no GitHub).
+- **All VMs that may receive reassigned threads must share the same `GIT_STORE_DIR`** (POC: multiple VM processes on one machine). Working trees (`WORKSPACE_DIR`) stay per-VM.
+- Durability window = **last successful `persist`**. Hard kill without a checkpoint loses unpersisted edits.
+- On `assignment`, VM always `restore(threadId)` before accepting tools for that thread.
+- Checkpoint policy (target):
+  1. **Best-effort `persist` at `agent_loop_done`** (add CP→VM `persist` or VM-local hook) — happy-path durability.
+  2. Graceful unhealthy (`/debug/unhealthy`) already `persist`s first — keep.
+  3. Before reassign, if the old VM is still connected, best-effort `persist`; if it is gone, proceed with last store state.
+
+### Event: CP restarts
+
+1. Boot: init DB; load all `assignments` with `status=active` into `vmByThread`; VM socket maps start empty.
+2. In-flight loops are gone (`runningLoops` empty). Do **not** auto-resume mid-generation. Partial turn blobs stay as written (see transcript failure TODOs). User may send a follow-up once a VM is available.
+3. When a VM `register`s with a known `externalId`: upsert `healthy`, attach socket. If it has an active assignment, **re-send `assignment`** so the (possibly fresh) process `restore`s the workspace.
+4. Follow-ups route via DB assignment → require connected socket for that `externalId`.
+
+### Event: VM disconnect (process kill / WS close) or unhealthy (heartbeat timeout)
+
+Treat close and heartbeat eviction the same:
+
+1. Drop socket from memory; set DB `virtual_machines.status = unhealthy`.
+2. **Keep** the `Assignment` row (sticky intent unchanged).
+3. If a loop is running for that thread: reject pending tool waiters → `agent_loop_error`; clear `runningLoops`.
+4. VM is **not** eligible for new `POST /threads` while unhealthy/disconnected.
+5. **Same VM comes back** (`register` with same `VM_EXTERNAL_ID`): mark `healthy`, attach socket, re-send `assignment` + `restore`. No assignment row change. Prefer this path over reassignment.
+
+### Event: reassign thread to another VM
+
+**When (lazy, on user action):** on `POST /threads/:id/messages`, if the sticky VM is not connected (or unhealthy / no socket):
+
+1. If a loop is already running → still `409` (unchanged).
+2. If sticky VM is connected again → use it (no reassign).
+3. Else if another VM is free (`healthy` + connected + no active assignment) → **reassign** (below).
+4. Else → `503` (sticky down and nothing to move to).
+
+Do **not** background-reassign while the user is idle (keeps behavior predictable; idle release is a separate TODO).
+
+**How:**
+
+1. Best-effort `persist` on old VM if still connected; otherwise use last store checkpoint.
+2. `UPDATE assignments SET vm_id = :newVm` (same row; POC does not keep assignment history).
+3. Refresh `vmByThread` cache.
+4. Send `assignment` to the new VM → it `restore`s.
+5. Proceed with the follow-up agent loop on the new VM.
+
+**Not in scope for this policy:** mid-loop live migration (always fail the loop first; reassign on a later prompt). Completing/releasing an assignment back to the pool without a replacement VM (idle free TODO).
+
+### State cheat-sheet
+
+| VM connected? | DB health | Active assignment? | Eligible for new thread? | Follow-up behavior |
+|---|---|---|---|---|
+| yes | healthy | no | yes | n/a |
+| yes | healthy | yes | no | sticky tools / loops on that VM |
+| no | unhealthy | yes | no | wait for same `externalId`, or lazy reassign on next prompt |
+| no | unhealthy | no | no | n/a until reconnect → healthy |
+
+### Multi-CP (explicitly later)
+
+Single-CP decisions above intentionally leave open: which process holds the VM socket, assign locking across writers, and sticky LB. When layering multi-CP, keep DB as SoT for assignments; add ownership / routing on top without changing the lazy-reassign + `persist`/`restore` workspace contract.

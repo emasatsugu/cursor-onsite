@@ -55,6 +55,7 @@ wss.on("connection", (ws: WebSocket) => {
 
       const toolCall: VmServerMessage = {
         type: "execute_tool_call",
+        threadId: "stub-thread-1",
         toolCallId: "tc_stub_read_1",
         name: "read_file",
         arguments: { path: "src/hello.js" },
@@ -65,6 +66,7 @@ wss.on("connection", (ws: WebSocket) => {
       // Exercise parallel fan-out: second call overlapping the first.
       const toolCall2: VmServerMessage = {
         type: "execute_tool_call",
+        threadId: "stub-thread-1",
         toolCallId: "tc_stub_read_2",
         name: "read_file",
         arguments: { path: "README.md", start_line: 1, end_line: 2 },

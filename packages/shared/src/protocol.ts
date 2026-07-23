@@ -118,6 +118,7 @@ export type VmServerMessage =
   | { type: "assignment"; threadId: string }
   | {
       type: "execute_tool_call";
+      threadId: string;
       toolCallId: string;
       name: ToolName;
       arguments: ToolArgs; // parsed object, not string

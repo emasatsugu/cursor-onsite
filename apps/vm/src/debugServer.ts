@@ -65,9 +65,10 @@ async function listDirectory(
  * Tiny debug HTTP server:
  * - GET  /debug/ls?path=.
  * - GET  /debug/status
- * - POST /debug/unhealthy           — pause heartbeats (CP times out ~30s)
- * - POST /debug/unhealthy?disconnect=1 — pause + close WS immediately
- * - POST /debug/healthy             — resume heartbeats / reconnect
+ * - GET|POST /debug/persist
+ * - GET|POST /debug/restore?threadId=
+ * - GET|POST /debug/unhealthy[?disconnect=1]
+ * - GET|POST /debug/healthy
  */
 export function startDebugServer(options: DebugServerOptions): http.Server {
   const server = http.createServer(async (req, res) => {
@@ -105,12 +106,49 @@ export function startDebugServer(options: DebugServerOptions): http.Server {
 
     if (
       (req.method === "POST" || req.method === "GET") &&
+      url.pathname === "/debug/persist"
+    ) {
+      try {
+        await options.client.persistWorkspace();
+        json(res, 200, {
+          ok: true,
+          action: "persist",
+          status: options.client.getDebugStatus(),
+        });
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        json(res, 400, { error: message });
+      }
+      return;
+    }
+
+    if (
+      (req.method === "POST" || req.method === "GET") &&
+      url.pathname === "/debug/restore"
+    ) {
+      try {
+        const threadId = url.searchParams.get("threadId") ?? undefined;
+        await options.client.restoreWorkspace(threadId ?? undefined);
+        json(res, 200, {
+          ok: true,
+          action: "restore",
+          status: options.client.getDebugStatus(),
+        });
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        json(res, 400, { error: message });
+      }
+      return;
+    }
+
+    if (
+      (req.method === "POST" || req.method === "GET") &&
       url.pathname === "/debug/unhealthy"
     ) {
       const disconnect =
         url.searchParams.get("disconnect") === "1" ||
         url.searchParams.get("disconnect") === "true";
-      const status = options.client.simulateUnhealthy({ disconnect });
+      const status = await options.client.simulateUnhealthy({ disconnect });
       console.log(`[vm:debug] /debug/unhealthy disconnect=${disconnect}`, status);
       json(res, 200, {
         ok: true,
@@ -149,9 +187,11 @@ export function startDebugServer(options: DebugServerOptions): http.Server {
       endpoints: [
         "GET /debug/ls?path=.",
         "GET /debug/status",
-        "POST /debug/unhealthy",
-        "POST /debug/unhealthy?disconnect=1",
-        "POST /debug/healthy",
+        "GET|POST /debug/persist",
+        "GET|POST /debug/restore?threadId=",
+        "GET|POST /debug/unhealthy",
+        "GET|POST /debug/unhealthy?disconnect=1",
+        "GET|POST /debug/healthy",
         "GET /health",
       ],
     });
@@ -159,7 +199,7 @@ export function startDebugServer(options: DebugServerOptions): http.Server {
 
   server.listen(options.port, () => {
     console.log(
-      `[vm] debug HTTP on :${options.port}  /debug/ls /debug/status /debug/unhealthy /debug/healthy`,
+      `[vm] debug HTTP on :${options.port}  /debug/ls /debug/status /debug/persist /debug/restore /debug/unhealthy /debug/healthy`,
     );
   });
 

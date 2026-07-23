@@ -53,11 +53,12 @@ Tools (hardcoded defs on control plane; executed on VM):
 - `edit_file` — `{ path: string, old_string: string, new_string: string }` (unique search-replace; fail if `old_string` not found or not unique)
 - `shell` — `{ command: string, cwd?: string }` → `{ stdout, stderr, exit_code }`
 
-Durable storage during the loop:
-- User prompt recorded in sqlite (via Transcript row)
-- Each message we get back from the agent results in a full overwrite of that turn's blob (atomic put of the entire value). Debounce later if too heavy.
+Durable storage during the loop (message-boundary writes):
+- One Transcript row + one blob per user turn. Blob = OpenAI-style messages for that turn only (no system prompt / tool defs).
+- Write on: (1) turn start → `[user]`; (2) after each model stream ends → append full `assistant` (text + complete `tool_calls`); (3) after all tool results for that step → append `role:tool` messages. Each write is a full overwrite of the blob value.
+- Do **not** persist on text deltas or `tool_call_start` — those are WS-only. History reload is boundary-accurate, not live mid-stream.
 - Note on blob APIs: object stores generally do **not** offer atomic append for structured JSON. Full overwrite is the right POC choice.
-- Stream all of the above events to the browser over websocket
+- Stream live events to the browser over websocket (independent of when the blob is written)
 
 API surface:
 **HTTP**
@@ -97,7 +98,7 @@ Data model:
 - Assignment — id, vmId, threadId, status: active / completed (stays `active` for life of thread)
 - Thread — id, userId (hardcoded demo user)
 - Transcript — one row per user turn; 1:1 with a blob. No system prompt or tool defs. To build OpenAI context: load all Transcripts for the thread (ordered) and concatenate blob contents. Fields: id, threadId, key
-- BlobStorage — key, value (messages for that turn; overwritten in full as agent messages arrive)
+- BlobStorage — key, value (messages for that turn; overwritten in full at message boundaries)
 
 Deferred:
 - Load manager / sticky routing for horizontally scaling the control plane
@@ -105,5 +106,6 @@ Deferred:
 - Snapshotting of VM state for mid-generation VM failures
 - Tool-call timeouts / max loop iterations / cancel mid-run
 - Reassign thread when assigned VM goes unhealthy
+- Transcript failure modes / replay (see implementation-edd Follow-ups)
 
 See `implementation-edd.md` for component ownership, normative message schemas, and parallel implementation plan.
