@@ -116,32 +116,15 @@ export async function runAgentLoop(
         ...toOpenAIMessages(turnMessages),
       ];
 
-      let persistTimer: ReturnType<typeof setTimeout> | null = null;
-      let pendingAssistantContent = "";
-
       const result = await streamChatCompletion(messages, (delta) => {
         if (!delta) return;
-        pendingAssistantContent += delta;
         broadcastToThread(threadId, {
           type: "assistant_message",
           threadId,
           transcriptId,
           delta,
         });
-        // Debounced-ish periodic overwrite while streaming text
-        if (persistTimer) clearTimeout(persistTimer);
-        persistTimer = setTimeout(() => {
-          void (async () => {
-            const blob = await loadBlob(key);
-            // Replace trailing assistant message if we already appended a partial one,
-            // else just overwrite with user + current assistant draft is complex —
-            // for POC: only persist full assistant at end of stream (below).
-            void blob;
-          })();
-        }, 200);
       });
-
-      if (persistTimer) clearTimeout(persistTimer);
 
       const blob = await loadBlob(key);
       const assistantMsg: TurnMessage = {

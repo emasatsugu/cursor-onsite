@@ -8,6 +8,10 @@
   "scripts": {
     "build:shared": "npm run build -w @poc/shared",
     "dev:cp": "npm run dev -w @poc/control-plane",
-    "start:cp": "npm run start -w @poc/control-plane"
+    "start:cp": "npm run start -w @poc/control-plane",
+    "dev:web": "npm run dev -w @poc/web",
+    "stub": "npm run stub -w @poc/web",
+    "dev:stub": "npm run stub -w @poc/web",
+    "build:web": "npm run build -w @poc/web"
   }
 }
