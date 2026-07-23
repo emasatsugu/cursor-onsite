@@ -111,6 +111,7 @@ Thread.hasOne(Assignment, { foreignKey: "threadId", as: "assignment" });
 Thread.hasMany(Transcript, { foreignKey: "threadId", as: "transcripts" });
 Transcript.belongsTo(Thread, { foreignKey: "threadId", as: "thread" });
 
-export async function initDb(): Promise<void> {
-  await sequelize.sync();
+export async function initDb(options?: { force?: boolean }): Promise<void> {
+  await sequelize.authenticate();
+  await sequelize.sync(options?.force ? { force: true } : undefined);
 }
