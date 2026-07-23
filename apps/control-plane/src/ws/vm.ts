@@ -12,8 +12,8 @@ import {
   touchVmHeartbeat,
   removeVm,
   threadIdsForVm,
-  clearThreadAssignment,
 } from "../memory/state.js";
+import { markVmUnhealthy, persistClear, upsertVmHealthy } from "../assignment/store.js";
 import { cpLog, debugPreview } from "../debug/log.js";
 
 function sendVm(ws: WebSocket, message: VmServerMessage, externalId?: string): void {
@@ -121,7 +121,10 @@ export function waitForPersistResponse(
   });
 }
 
-function handleDisconnect(externalId: string, reason: "close" | "heartbeat_timeout"): void {
+async function handleDisconnect(
+  externalId: string,
+  reason: "close" | "heartbeat_timeout"
+): Promise<void> {
   cpLog(`VM removed ${externalId} reason=${reason}`);
   const ws = vmSockets.get(externalId);
   const threads = threadIdsForVm(externalId);
@@ -148,11 +151,13 @@ function handleDisconnect(externalId: string, reason: "close" | "heartbeat_timeo
       }
       cpLog(`in-flight work on thread=${threadId} will fail (VM gone)`);
     }
-    clearThreadAssignment(threadId);
+    await persistClear(threadId);
     cpLog(
       `cleared sticky thread=${threadId} (VM ${externalId} ${reason}) — slot free`
     );
   }
+
+  await markVmUnhealthy(externalId);
 }
 
 /** Default 30s — VM heartbeats every 5s, so this allows several misses. */
@@ -176,7 +181,7 @@ export function startVmHeartbeatMonitor(): NodeJS.Timeout {
         cpLog(
           `VM heartbeat timeout ${externalId} lastSeenAgeMs=${age} timeoutMs=${VM_HEARTBEAT_TIMEOUT_MS}`
         );
-        handleDisconnect(externalId, "heartbeat_timeout");
+        void handleDisconnect(externalId, "heartbeat_timeout");
       }
     }
   }, SWEEP_INTERVAL_MS);
@@ -202,6 +207,9 @@ export function createVmWss(): WebSocketServer {
         if (msg.type === "register") {
           externalId = msg.externalId;
           registerVm(externalId, ws);
+          void upsertVmHealthy(externalId).catch((err) => {
+            console.error("[vm] upsertVmHealthy failed", err);
+          });
           cpLog(`← VM register ${externalId} (pool size=${vmSockets.size})`);
           // Sticky threads (if any) get re-bound after VM reconnect.
           for (const threadId of threadIdsForVm(externalId)) {
@@ -263,7 +271,7 @@ export function createVmWss(): WebSocketServer {
       if (externalId) {
         // Only handle if still in pool (heartbeat sweeper may have already removed it).
         if (vmSockets.has(externalId) || vmPool.has(externalId)) {
-          handleDisconnect(externalId, "close");
+          void handleDisconnect(externalId, "close");
         }
       }
     });

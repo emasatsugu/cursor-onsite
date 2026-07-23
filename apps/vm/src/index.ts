@@ -2,6 +2,7 @@ import type http from "node:http";
 import { loadConfig } from "./config.js";
 import { ControlPlaneClient } from "./cpClient.js";
 import { startDebugServer } from "./debugServer.js";
+import { startMainServer } from "./mainServer.js";
 import { GitWorkspaceStore } from "./workspaceStore.js";
 
 const config = loadConfig();
@@ -20,6 +21,7 @@ console.log("[vm] starting", {
   controlPlaneWsUrl: config.controlPlaneWsUrl,
   workspaceDir: config.workspaceDir,
   heartbeatIntervalMs: config.heartbeatIntervalMs,
+  mainPort: config.mainPort,
   debugPort: config.debugPort,
   externalId: config.externalId,
   gitRemote: config.gitRemote,
@@ -27,6 +29,14 @@ console.log("[vm] starting", {
 });
 
 client.start();
+
+let mainServer: http.Server | null = null;
+if (config.mainPort > 0) {
+  mainServer = startMainServer({
+    port: config.mainPort,
+    externalId: config.externalId,
+  });
+}
 
 let debugServer: http.Server | null = null;
 if (config.debugPort > 0) {
@@ -40,6 +50,7 @@ if (config.debugPort > 0) {
 function shutdown(signal: string) {
   console.log(`[vm] received ${signal}; shutting down`);
   client.stop();
+  mainServer?.close();
   debugServer?.close();
   process.exit(0);
 }

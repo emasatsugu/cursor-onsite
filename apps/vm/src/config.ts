@@ -8,6 +8,8 @@ export type VmConfig = {
   controlPlaneWsUrl: string;
   workspaceDir: string;
   heartbeatIntervalMs: number;
+  /** Local HTTP port for /health (0 = disabled). From PORT (or MAIN_PORT). */
+  mainPort: number;
   /** Local HTTP port for debug endpoints (0 = disabled). */
   debugPort: number;
   /** Stable id used for CP register/heartbeat — required via VM_EXTERNAL_ID. */
@@ -20,7 +22,7 @@ export function resolveExternalId(env: NodeJS.ProcessEnv = process.env): string 
   const fromEnv = env.VM_EXTERNAL_ID?.trim();
   if (!fromEnv) {
     throw new Error(
-      "VM_EXTERNAL_ID is required (e.g. VM_EXTERNAL_ID=vm-a npm run start:vm)",
+      "VM_EXTERNAL_ID is required (e.g. VM_EXTERNAL_ID=2 npm run start:vm)",
     );
   }
   return fromEnv;
@@ -31,10 +33,14 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): VmConfig {
     env.WORKSPACE_DIR ?? path.join(__dirname, "..", "workspace"),
   );
 
+  // Prefer PORT (manual / start-vms); MAIN_PORT kept as alias.
+  const mainPort = Number(env.PORT ?? env.MAIN_PORT ?? "0");
+
   return {
     controlPlaneWsUrl: env.CONTROL_PLANE_WS_URL ?? "ws://localhost:3001/ws/vm",
     workspaceDir,
     heartbeatIntervalMs: Number(env.HEARTBEAT_INTERVAL_MS ?? "5000"),
+    mainPort,
     debugPort: Number(env.DEBUG_PORT ?? "3002"),
     externalId: resolveExternalId(env),
     gitRemote: WORKSPACE_GIT_REMOTE,

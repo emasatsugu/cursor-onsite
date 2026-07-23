@@ -13,7 +13,7 @@ export const vmSockets = new Map<string, WebSocket>();
 export const vmPool = new Map<string, VmPoolEntry>();
 export const browserSubs = new Map<string, Set<WebSocket>>();
 export const runningLoops = new Set<string>();
-/** Sticky assignment: threadId → VM externalId (in-memory only). */
+/** Sticky assignment cache: threadId → VM externalId (hydrated from DB on boot). */
 export const vmByThread = new Map<string, string>();
 
 /**

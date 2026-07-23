@@ -10,17 +10,14 @@ import type {
   TranscriptDTO,
 } from "@poc/shared";
 import { BlobStorage, Thread, Transcript } from "../db/index.js";
-import {
-  assignVmToThread,
-  findAvailableVm,
-  runningLoops,
-} from "../memory/state.js";
+import { findAvailableVm, runningLoops } from "../memory/state.js";
 import {
   createTranscriptWithUserPrompt,
   runAgentLoop,
 } from "../agent/loop.js";
 import { sendAssignment } from "../ws/vm.js";
 import { ensureConnectedVmForThread } from "../assignment/lifecycle.js";
+import { persistAssign } from "../assignment/store.js";
 import { cpLog } from "../debug/log.js";
 import { buildDebugSnapshot } from "../debug/snapshot.js";
 const DEMO_USER_ID = process.env.DEMO_USER_ID ?? "demo-user";
@@ -45,7 +42,12 @@ export function createHttpRouter(): Router {
    * GET /debug  or  GET /debug/state
    */
   const debugHandler = (_req: Request, res: Response) => {
-    res.json(buildDebugSnapshot());
+    void buildDebugSnapshot()
+      .then((snap) => res.json(snap))
+      .catch((err) => {
+        console.error(err);
+        res.status(500).json({ error: "Failed to build debug snapshot" });
+      });
   };
   router.get("/debug", debugHandler);
   router.get("/debug/state", debugHandler);
@@ -113,7 +115,7 @@ export function createHttpRouter(): Router {
       }
 
       const thread = await Thread.create({ userId: DEMO_USER_ID });
-      assignVmToThread(thread.id, externalId);
+      await persistAssign(thread.id, externalId);
       cpLog(`new assignment thread=${thread.id} → VM ${externalId}`);
       sendAssignment(externalId, thread.id);
 

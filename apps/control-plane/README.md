@@ -2,8 +2,10 @@
 
 Node/Express + `ws` + Sequelize/SQLite. Owns `@poc/shared` and the agent loop.
 
-**In-memory (not DB):** VM pool, sticky assignments, availability, WS handles.  
-**SQLite:** threads + transcripts/blobs only (history). `virtual_machines` / `assignments` tables may still exist from earlier schema but are unused at runtime.
+**SQLite (SoT):** threads, transcripts/blobs, `virtual_machines`, `assignments` (sticky routing).  
+**In-memory:** live WS handles, connectedness / heartbeats, `vmByThread` cache, browser subs, running loops.
+
+On boot, active assignments are hydrated into the cache. VM disconnect / idle reclaim marks assignments `completed` and frees the slot; follow-ups assign any free connected VM on demand.
 
 ## Run
 
@@ -23,7 +25,7 @@ Env: see `.env.example`. Set `OPENAI_API_KEY` and `MOCK_OPENAI=0` for real OpenA
 ## Endpoints
 
 - HTTP `GET/POST /threads`, `GET /threads/:id`, `POST /threads/:id/messages`, `GET /health`
-- HTTP `GET /debug` (alias `/debug/state`) — `vmPool`, `assignments`, `browserWs` (+ idle reclaim timers)
+- HTTP `GET /debug` (alias `/debug/state`) — live pool + `db.virtualMachines` / `db.activeAssignments`
 - WS `ws://localhost:3001/ws/browser` — subscribe-only streaming
 - WS `ws://localhost:3001/ws/vm` — VM register / heartbeat / tool responses
 

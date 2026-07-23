@@ -15,6 +15,7 @@
     "build:web": "npm run build -w @poc/web",
     "dev:vm": "npm run dev -w @poc/vm",
     "start:vm": "npm run start -w @poc/vm",
+    "start:vms": "./scripts/start-vms.sh",
     "test:vm": "npm run test -w @poc/vm",
     "stub:cp": "npm run stub:cp -w @poc/vm",
     "db:init": "npm run db:init -w @poc/control-plane",

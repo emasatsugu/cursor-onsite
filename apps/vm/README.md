@@ -10,9 +10,33 @@ and executes tools against a local workspace.
 | `CONTROL_PLANE_WS_URL` | `ws://localhost:3001/ws/vm` |
 | `WORKSPACE_DIR` | `./workspace` (resolved from package dir) |
 | `HEARTBEAT_INTERVAL_MS` | `5000` |
+| `PORT` | `0` (disabled) — main HTTP `GET /health` when set |
 | `DEBUG_PORT` | `3002` (set `0` to disable) |
-| `VM_EXTERNAL_ID` | **required** — stable id used to register with the CP (e.g. `vm-a`) |
+| `VM_EXTERNAL_ID` | **required** — stable id used to register with the CP (e.g. `2`) |
 | `GITHUB_TOKEN` | **required for push** — PAT with `contents:write` on the workspace repo |
+
+### Fleet launcher
+
+From repo root (CP should already be running):
+
+```bash
+export GITHUB_TOKEN=ghp_...
+npm run start:vms        # 2 VMs: ids 1, 2
+npm run start:vms -- 3   # ids 1 .. 3
+# or: ./scripts/start-vms.sh 3
+```
+
+Same derivation as a manual start for id `2`:
+
+```bash
+WORKSPACE_DIR=./workspace-2 DEBUG_PORT=3021 PORT=3020 VM_EXTERNAL_ID=2 npm run start:vm
+```
+
+| id | `VM_EXTERNAL_ID` | `PORT` | `DEBUG_PORT` | `WORKSPACE_DIR` |
+|---|---|---|---|---|
+| N (≥1) | `N` | `3000 + N*10` | `PORT + 1` | `./workspace-N` |
+
+Child logs merge on stdout prefixed `[N]`.
 
 ### Workspace store (shared GitHub repo)
 
@@ -27,10 +51,10 @@ Create that public repo with a `main` branch first. Policy:
 
 ```bash
 export GITHUB_TOKEN=ghp_...
-VM_EXTERNAL_ID=vm-a npm run start:vm
+WORKSPACE_DIR=./workspace-1 DEBUG_PORT=3011 PORT=3010 VM_EXTERNAL_ID=1 npm run start:vm
 
-curl 'http://localhost:3002/debug/persist'
-curl 'http://localhost:3002/debug/restore?threadId=<uuid>'
+curl 'http://localhost:3011/debug/persist'
+curl 'http://localhost:3011/debug/restore?threadId=<uuid>'
 ```
 
 ## Debug
@@ -59,14 +83,12 @@ curl 'http://localhost:3002/debug/restore?threadId=<uuid>'
 ```
 Watch CP logs / `GET http://localhost:3001/debug` to confirm pool eviction and re-register.
 
-`VM_EXTERNAL_ID` is required:
+`VM_EXTERNAL_ID` is required. Prefer the id-derived scheme (or `npm run start:vms`):
 
 ```bash
-VM_EXTERNAL_ID=vm-a npm run start:vm
-VM_EXTERNAL_ID=vm-b DEBUG_PORT=3003 WORKSPACE_DIR=./workspace-b npm run start:vm
+WORKSPACE_DIR=./workspace-1 DEBUG_PORT=3011 PORT=3010 VM_EXTERNAL_ID=1 npm run start:vm
+WORKSPACE_DIR=./workspace-2 DEBUG_PORT=3021 PORT=3020 VM_EXTERNAL_ID=2 npm run start:vm
 ```
-
-For a second VM on another port: `DEBUG_PORT=3003 WORKSPACE_DIR=./workspace-b VM_EXTERNAL_ID=vm-b npm run start:vm`.
 ## Scripts
 
 ```bash
