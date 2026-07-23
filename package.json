@@ -12,6 +12,10 @@
     "dev:web": "npm run dev -w @poc/web",
     "stub": "npm run stub -w @poc/web",
     "dev:stub": "npm run stub -w @poc/web",
-    "build:web": "npm run build -w @poc/web"
+    "build:web": "npm run build -w @poc/web",
+    "dev:vm": "npm run dev -w @poc/vm",
+    "start:vm": "npm run start -w @poc/vm",
+    "test:vm": "npm run test -w @poc/vm",
+    "stub:cp": "npm run stub:cp -w @poc/vm"
   }
 }

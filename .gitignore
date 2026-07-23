@@ -5,3 +5,4 @@ data/
 .env
 .DS_Store
 *.log
+apps/control-plane/data/

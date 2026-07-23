@@ -1,0 +1,22 @@
+{
+  "name": "@poc/vm",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "start": "tsx src/index.ts",
+    "stub:cp": "tsx src/stubCp.ts",
+    "test": "tsx --test src/**/*.test.ts"
+  },
+  "dependencies": {
+    "@poc/shared": "*",
+    "ws": "^8.18.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.13.10",
+    "@types/ws": "^8.18.0",
+    "tsx": "^4.19.3",
+    "typescript": "^5.8.2"
+  }
+}
