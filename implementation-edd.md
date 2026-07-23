@@ -525,3 +525,13 @@ Same as above but `POST /threads/:id/messages`, skip VM picker / `assignment` (a
 - Resume after CP restart
 - Exact pixel-perfect UI
 - Token-accurate cost accounting
+
+---
+
+## Follow-ups / TODOs (post-POC)
+
+- **Reassign thread to a new VM when the sticky VM dies** — today follow-ups 503 with “Sticky VM not connected”. Needs workspace lifecycle (git clone / sync / snapshot restore) so a new VM can pick up the same files; then CP can clear the old assignment and pick an available VM.
+- Persist VM pool + assignments again (DB or Redis) when scaling to multiple control-plane instances + sticky routing.
+- Resume / recover in-flight agent loops after CP restart.
+- Tool-call timeouts, max iterations UX, and cancel mid-run from the browser.
+- Optional: allow the same VM `externalId` to survive process restart (stable id) so sticky assignment can reconnect without full reassignment.

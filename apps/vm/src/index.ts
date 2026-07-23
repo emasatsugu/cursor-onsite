@@ -21,6 +21,7 @@ if (config.debugPort > 0) {
   debugServer = startDebugServer({
     port: config.debugPort,
     workspaceDir: config.workspaceDir,
+    client,
   });
 }
 

@@ -2,10 +2,12 @@ import http from "node:http";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { resolveWorkspacePath } from "./tools/paths.js";
+import type { ControlPlaneClient } from "./cpClient.js";
 
 export type DebugServerOptions = {
   port: number;
   workspaceDir: string;
+  client: ControlPlaneClient;
 };
 
 type DirEntry = {
@@ -13,6 +15,11 @@ type DirEntry = {
   type: "file" | "directory" | "other";
   size?: number;
 };
+
+function json(res: http.ServerResponse, status: number, body: unknown): void {
+  res.writeHead(status, { "content-type": "application/json" });
+  res.end(JSON.stringify(body, null, 2));
+}
 
 async function listDirectory(
   workspaceDir: string,
@@ -55,8 +62,12 @@ async function listDirectory(
 }
 
 /**
- * Tiny debug HTTP server: GET /debug/ls?path=.
- * Logs directory listing to the VM console and returns JSON.
+ * Tiny debug HTTP server:
+ * - GET  /debug/ls?path=.
+ * - GET  /debug/status
+ * - POST /debug/unhealthy           — pause heartbeats (CP times out ~30s)
+ * - POST /debug/unhealthy?disconnect=1 — pause + close WS immediately
+ * - POST /debug/healthy             — resume heartbeats / reconnect
  */
 export function startDebugServer(options: DebugServerOptions): http.Server {
   const server = http.createServer(async (req, res) => {
@@ -68,8 +79,7 @@ export function startDebugServer(options: DebugServerOptions): http.Server {
 
       if (!result.ok) {
         console.log(`[vm:debug] ls failed path=${dirPath}: ${result.error}`);
-        res.writeHead(400, { "content-type": "application/json" });
-        res.end(JSON.stringify({ error: result.error }));
+        json(res, 400, { error: result.error });
         return;
       }
 
@@ -80,33 +90,77 @@ export function startDebugServer(options: DebugServerOptions): http.Server {
       }
       console.log(`[vm:debug] ${result.entries.length} entries`);
 
-      res.writeHead(200, { "content-type": "application/json" });
-      res.end(
-        JSON.stringify(
-          {
-            path: dirPath,
-            absolutePath: result.absolutePath,
-            entries: result.entries,
-          },
-          null,
-          2,
-        ),
-      );
+      json(res, 200, {
+        path: dirPath,
+        absolutePath: result.absolutePath,
+        entries: result.entries,
+      });
+      return;
+    }
+
+    if (req.method === "GET" && url.pathname === "/debug/status") {
+      json(res, 200, options.client.getDebugStatus());
+      return;
+    }
+
+    if (
+      (req.method === "POST" || req.method === "GET") &&
+      url.pathname === "/debug/unhealthy"
+    ) {
+      const disconnect =
+        url.searchParams.get("disconnect") === "1" ||
+        url.searchParams.get("disconnect") === "true";
+      const status = options.client.simulateUnhealthy({ disconnect });
+      console.log(`[vm:debug] /debug/unhealthy disconnect=${disconnect}`, status);
+      json(res, 200, {
+        ok: true,
+        action: "unhealthy",
+        disconnect,
+        status,
+        note: disconnect
+          ? "WS closed immediately; will not reconnect until /debug/healthy"
+          : "Heartbeats paused; CP should evict after VM_HEARTBEAT_TIMEOUT_MS (~30s)",
+      });
+      return;
+    }
+
+    if (
+      (req.method === "POST" || req.method === "GET") &&
+      url.pathname === "/debug/healthy"
+    ) {
+      const status = options.client.simulateHealthy();
+      console.log(`[vm:debug] /debug/healthy`, status);
+      json(res, 200, {
+        ok: true,
+        action: "healthy",
+        status,
+        note: "Heartbeats + reconnect enabled; connecting if needed",
+      });
       return;
     }
 
     if (req.method === "GET" && url.pathname === "/health") {
-      res.writeHead(200, { "content-type": "application/json" });
-      res.end(JSON.stringify({ ok: true }));
+      json(res, 200, { ok: true, ...options.client.getDebugStatus() });
       return;
     }
 
-    res.writeHead(404, { "content-type": "application/json" });
-    res.end(JSON.stringify({ error: "not found; try GET /debug/ls?path=." }));
+    json(res, 404, {
+      error: "not found",
+      endpoints: [
+        "GET /debug/ls?path=.",
+        "GET /debug/status",
+        "POST /debug/unhealthy",
+        "POST /debug/unhealthy?disconnect=1",
+        "POST /debug/healthy",
+        "GET /health",
+      ],
+    });
   });
 
   server.listen(options.port, () => {
-    console.log(`[vm] debug HTTP on :${options.port}  GET /debug/ls?path=.`);
+    console.log(
+      `[vm] debug HTTP on :${options.port}  /debug/ls /debug/status /debug/unhealthy /debug/healthy`,
+    );
   });
 
   return server;

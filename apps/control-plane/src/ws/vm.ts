@@ -2,12 +2,15 @@ import type { IncomingMessage } from "node:http";
 import type { Duplex } from "node:stream";
 import { WebSocketServer, WebSocket } from "ws";
 import type { VmClientMessage, VmServerMessage, ToolResultPayload } from "@poc/shared";
-import { VirtualMachine } from "../db/index.js";
 import {
   vmSockets,
-  vmByThread,
+  vmPool,
   pendingToolCalls,
   runningLoops,
+  registerVm,
+  touchVmHeartbeat,
+  removeVm,
+  threadIdsForVm,
 } from "../memory/state.js";
 import { cpLog, debugPreview } from "../debug/log.js";
 
@@ -76,30 +79,60 @@ export function waitForToolCallResponse(
   });
 }
 
-async function handleDisconnect(externalId: string): Promise<void> {
-  cpLog(`VM disconnected ${externalId}`);
-  vmSockets.delete(externalId);
-  try {
-    const vm = await VirtualMachine.findOne({ where: { externalId } });
-    if (vm) {
-      await vm.update({ status: "unhealthy" });
-      cpLog(`VM ${externalId} marked unhealthy`);
+function handleDisconnect(externalId: string, reason: "close" | "heartbeat_timeout"): void {
+  cpLog(`VM removed ${externalId} reason=${reason}`);
+  const ws = vmSockets.get(externalId);
+  removeVm(externalId);
+
+  // Drop the socket if we're evicting for missed heartbeats (close path already closed).
+  if (reason === "heartbeat_timeout" && ws && ws.readyState === WebSocket.OPEN) {
+    try {
+      ws.close();
+    } catch {
+      // ignore
     }
+  }
 
-    for (const [threadId, ext] of [...vmByThread.entries()]) {
-      if (ext !== externalId) continue;
-      if (!runningLoops.has(threadId)) continue;
+  // Sticky assignment is kept in vmByThread (follow-ups will 503 until that VM reconnects
+  // with the same externalId — which won't happen for this POC since VMs mint new IDs).
+  const threads = threadIdsForVm(externalId);
+  for (const threadId of threads) {
+    if (!runningLoops.has(threadId)) continue;
+    for (const [toolCallId, waiter] of [...pendingToolCalls.entries()]) {
+      waiter.reject(
+        new Error(`VM ${externalId} disconnected during tool call ${toolCallId}`)
+      );
+      pendingToolCalls.delete(toolCallId);
+    }
+    cpLog(`in-flight work on thread=${threadId} will fail (VM gone)`);
+  }
+}
 
-      for (const [toolCallId, waiter] of [...pendingToolCalls.entries()]) {
-        waiter.reject(
-          new Error(`VM ${externalId} disconnected during tool call ${toolCallId}`)
+/** Default 30s — VM heartbeats every 5s, so this allows several misses. */
+export const VM_HEARTBEAT_TIMEOUT_MS = Number(
+  process.env.VM_HEARTBEAT_TIMEOUT_MS ?? 30_000
+);
+const SWEEP_INTERVAL_MS = Math.min(5_000, Math.max(1_000, VM_HEARTBEAT_TIMEOUT_MS / 3));
+
+/**
+ * Periodically evict VMs that have not registered/heartbeated within the timeout.
+ */
+export function startVmHeartbeatMonitor(): NodeJS.Timeout {
+  cpLog(
+    `VM heartbeat monitor started timeoutMs=${VM_HEARTBEAT_TIMEOUT_MS} sweepMs=${SWEEP_INTERVAL_MS}`
+  );
+  return setInterval(() => {
+    const now = Date.now();
+    for (const [externalId, entry] of [...vmPool.entries()]) {
+      const age = now - entry.lastSeenAt;
+      if (age > VM_HEARTBEAT_TIMEOUT_MS) {
+        cpLog(
+          `VM heartbeat timeout ${externalId} lastSeenAgeMs=${age} timeoutMs=${VM_HEARTBEAT_TIMEOUT_MS}`
         );
-        pendingToolCalls.delete(toolCallId);
+        handleDisconnect(externalId, "heartbeat_timeout");
       }
     }
-  } catch (err) {
-    console.error("handleDisconnect error", err);
-  }
+  }, SWEEP_INTERVAL_MS);
 }
 
 export function createVmWss(): WebSocketServer {
@@ -109,7 +142,7 @@ export function createVmWss(): WebSocketServer {
     let externalId: string | null = null;
     cpLog("VM socket connected (awaiting register)");
 
-    ws.on("message", async (data) => {
+    ws.on("message", (data) => {
       let msg: VmClientMessage;
       try {
         msg = JSON.parse(data.toString()) as VmClientMessage;
@@ -121,28 +154,15 @@ export function createVmWss(): WebSocketServer {
       try {
         if (msg.type === "register") {
           externalId = msg.externalId;
-          vmSockets.set(externalId, ws);
-          const [vm] = await VirtualMachine.findOrCreate({
-            where: { externalId },
-            defaults: { externalId, status: "healthy" },
-          });
-          if (vm.status !== "healthy") {
-            await vm.update({ status: "healthy" });
-          }
+          registerVm(externalId, ws);
           cpLog(`← VM register ${externalId} (pool size=${vmSockets.size})`);
           return;
         }
 
         if (msg.type === "heartbeat") {
           const id = msg.externalId;
-          if (!vmSockets.has(id)) {
-            vmSockets.set(id, ws);
-            externalId = id;
-          }
-          const vm = await VirtualMachine.findOne({ where: { externalId: id } });
-          if (vm && vm.status !== "healthy") {
-            await vm.update({ status: "healthy" });
-          }
+          touchVmHeartbeat(id, ws);
+          externalId = id;
           cpLog(`← VM heartbeat ${id}`);
           return;
         }
@@ -170,7 +190,10 @@ export function createVmWss(): WebSocketServer {
 
     ws.on("close", () => {
       if (externalId) {
-        void handleDisconnect(externalId);
+        // Only handle if still in pool (heartbeat sweeper may have already removed it).
+        if (vmSockets.has(externalId) || vmPool.has(externalId)) {
+          handleDisconnect(externalId, "close");
+        }
       } else {
         cpLog("VM socket closed before register");
       }

@@ -2,6 +2,9 @@
 
 Node/Express + `ws` + Sequelize/SQLite. Owns `@poc/shared` and the agent loop.
 
+**In-memory (not DB):** VM pool, sticky assignments, availability, WS handles.  
+**SQLite:** threads + transcripts/blobs only (history). `virtual_machines` / `assignments` tables may still exist from earlier schema but are unused at runtime.
+
 ## Run
 
 ```bash

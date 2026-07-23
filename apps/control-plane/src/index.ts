@@ -6,7 +6,7 @@ import { shouldUseMockOpenAI } from "./env.js";
 import { initDb } from "./db/index.js";
 import { createHttpRouter } from "./http/routes.js";
 import { createBrowserWss, handleBrowserUpgrade } from "./ws/browserServer.js";
-import { createVmWss, handleVmUpgrade } from "./ws/vm.js";
+import { createVmWss, handleVmUpgrade, startVmHeartbeatMonitor } from "./ws/vm.js";
 
 const PORT = Number(process.env.PORT ?? 3001);
 
@@ -25,6 +25,7 @@ async function main(): Promise<void> {
   const server = http.createServer(app);
   const browserWss = createBrowserWss();
   const vmWss = createVmWss();
+  startVmHeartbeatMonitor();
 
   server.on("upgrade", (req, socket, head) => {
     const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "localhost"}`);

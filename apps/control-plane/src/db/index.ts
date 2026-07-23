@@ -13,6 +13,10 @@ export const sequelize = new Sequelize({
   logging: false,
 });
 
+// NOTE: VirtualMachine + Assignment models are unused at runtime for now.
+// Pool / sticky assignment / availability live in memory/state.ts.
+// Kept so we can reintroduce durable shared state when scaling to multiple CPs.
+
 export class VirtualMachine extends Model {
   declare id: string;
   declare externalId: string;

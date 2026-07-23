@@ -20,6 +20,16 @@ export type CpClientOptions = VmConfig & {
   log?: (...args: unknown[]) => void;
 };
 
+export type VmClientDebugStatus = {
+  externalId: string;
+  healthy: boolean;
+  connected: boolean;
+  heartbeatsEnabled: boolean;
+  reconnectEnabled: boolean;
+  threadId: string | null;
+  heartbeatCount: number;
+};
+
 export class ControlPlaneClient {
   readonly externalId: string;
   private readonly config: VmConfig;
@@ -30,6 +40,10 @@ export class ControlPlaneClient {
   private stopped = false;
   private currentThreadId: string | null = null;
   private heartbeatCount = 0;
+  /** When false, heartbeats are paused (simulate unhealthy). */
+  private heartbeatsEnabled = true;
+  /** When false, do not auto-reconnect after close (stays unhealthy). */
+  private reconnectEnabled = true;
 
   constructor(options: CpClientOptions) {
     this.config = options;
@@ -41,8 +55,60 @@ export class ControlPlaneClient {
     return this.currentThreadId;
   }
 
+  getDebugStatus(): VmClientDebugStatus {
+    return {
+      externalId: this.externalId,
+      healthy: this.heartbeatsEnabled && this.reconnectEnabled,
+      connected: this.ws?.readyState === WebSocket.OPEN,
+      heartbeatsEnabled: this.heartbeatsEnabled,
+      reconnectEnabled: this.reconnectEnabled,
+      threadId: this.currentThreadId,
+      heartbeatCount: this.heartbeatCount,
+    };
+  }
+
+  /**
+   * Simulate unhealthy: stop heartbeats and suppress reconnect.
+   * If `disconnect` is true, close the WS immediately; otherwise leave it open
+   * so the control plane can observe a heartbeat timeout.
+   */
+  simulateUnhealthy(options?: { disconnect?: boolean }): VmClientDebugStatus {
+    this.heartbeatsEnabled = false;
+    this.reconnectEnabled = false;
+    this.clearHeartbeat();
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
+    this.log(
+      `simulate unhealthy (disconnect=${Boolean(options?.disconnect)})`
+    );
+    if (options?.disconnect && this.ws) {
+      this.ws.close();
+      this.ws = null;
+    }
+    return this.getDebugStatus();
+  }
+
+  /**
+   * Simulate healthy: resume heartbeats + reconnect; connect if currently down.
+   */
+  simulateHealthy(): VmClientDebugStatus {
+    this.heartbeatsEnabled = true;
+    this.reconnectEnabled = true;
+    this.log("simulate healthy");
+    if (this.ws?.readyState === WebSocket.OPEN) {
+      this.startHeartbeat();
+    } else {
+      this.connect();
+    }
+    return this.getDebugStatus();
+  }
+
   start(): void {
     this.stopped = false;
+    this.heartbeatsEnabled = true;
+    this.reconnectEnabled = true;
     this.connect();
   }
 
@@ -89,7 +155,7 @@ export class ControlPlaneClient {
   }
 
   private scheduleReconnect(): void {
-    if (this.stopped || this.reconnectTimer) return;
+    if (this.stopped || !this.reconnectEnabled || this.reconnectTimer) return;
     this.log("scheduling reconnect in 2000ms");
     this.reconnectTimer = setTimeout(() => {
       this.reconnectTimer = null;
@@ -99,6 +165,10 @@ export class ControlPlaneClient {
 
   private startHeartbeat(): void {
     this.clearHeartbeat();
+    if (!this.heartbeatsEnabled) {
+      this.log("heartbeats suppressed (unhealthy mode)");
+      return;
+    }
     this.heartbeatCount = 0;
     this.heartbeatTimer = setInterval(() => {
       this.heartbeatCount += 1;

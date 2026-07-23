@@ -9,17 +9,20 @@ import type {
   TranscriptBlob,
   TranscriptDTO,
 } from "@poc/shared";
+import { BlobStorage, Thread, Transcript } from "../db/index.js";
 import {
-  Assignment,
-  BlobStorage,
-  Thread,
-  Transcript,
-  VirtualMachine,
-} from "../db/index.js";
-import { browserSubs, runningLoops, vmByThread, vmSockets } from "../memory/state.js";
+  assignVmToThread,
+  browserSubs,
+  findAvailableVm,
+  getAssignedVm,
+  isVmAssigned,
+  runningLoops,
+  vmByThread,
+  vmPool,
+  vmSockets,
+} from "../memory/state.js";
 import {
   createTranscriptWithUserPrompt,
-  findHealthyUnassignedVm,
   runAgentLoop,
 } from "../agent/loop.js";
 import { sendAssignment } from "../ws/vm.js";
@@ -43,75 +46,48 @@ export function createHttpRouter(): Router {
   });
 
   /**
-   * Debug: in-memory VM pool + DB assignments + browser subscriptions.
+   * Debug: in-memory VM pool + assignments + browser subscriptions.
    * GET /debug/state
    */
-  router.get("/debug/state", async (_req: Request, res: Response) => {
-    try {
-      const dbVms = await VirtualMachine.findAll({ order: [["createdAt", "ASC"]] });
-      const assignments = await Assignment.findAll({
-        order: [["createdAt", "ASC"]],
-      });
+  router.get("/debug/state", (_req: Request, res: Response) => {
+    const pool = [...vmPool.values()].map((vm) => {
+      const connected = vmSockets.has(vm.externalId);
+      const assigned = isVmAssigned(vm.externalId);
+      const threadIds = [...vmByThread.entries()]
+        .filter(([, ext]) => ext === vm.externalId)
+        .map(([threadId]) => threadId);
+      return {
+        externalId: vm.externalId,
+        connected,
+        assigned,
+        threadIds,
+        connectedAt: new Date(vm.connectedAt).toISOString(),
+        lastSeenAt: new Date(vm.lastSeenAt).toISOString(),
+        availableForNewThread: connected && !assigned,
+      };
+    });
 
-      const assignedVmIds = new Set(
-        assignments.filter((a) => a.status === "active").map((a) => a.vmId)
-      );
+    const assignments = [...vmByThread.entries()].map(([threadId, vmExternalId]) => ({
+      threadId,
+      vmExternalId,
+      loopRunning: runningLoops.has(threadId),
+      browserSubscribers: browserSubs.get(threadId)?.size ?? 0,
+      vmConnected: vmSockets.has(vmExternalId),
+    }));
 
-      const pool = dbVms.map((vm) => {
-        const connected = vmSockets.has(vm.externalId);
-        const assigned = assignedVmIds.has(vm.id);
-        const threadIds = [...vmByThread.entries()]
-          .filter(([, ext]) => ext === vm.externalId)
-          .map(([threadId]) => threadId);
-        return {
-          id: vm.id,
-          externalId: vm.externalId,
-          status: vm.status,
-          connected,
-          assigned,
-          threadIds,
-          availableForNewThread: connected && vm.status === "healthy" && !assigned,
-        };
-      });
-
-      const assignmentRows = await Promise.all(
-        assignments.map(async (a) => {
-          const vm = dbVms.find((v) => v.id === a.vmId);
-          return {
-            id: a.id,
-            threadId: a.threadId,
-            vmId: a.vmId,
-            vmExternalId: vm?.externalId ?? null,
-            status: a.status,
-            createdAt: a.createdAt.toISOString(),
-            loopRunning: runningLoops.has(a.threadId),
-            browserSubscribers: browserSubs.get(a.threadId)?.size ?? 0,
-          };
-        })
-      );
-
-      const connectedExternalIds = [...vmSockets.keys()];
-      const orphanSockets = connectedExternalIds.filter(
-        (ext) => !dbVms.some((v) => v.externalId === ext)
-      );
-
-      res.json({
-        pool,
-        assignments: assignmentRows,
-        inMemory: {
-          connectedExternalIds,
-          orphanSockets,
-          vmByThread: Object.fromEntries(vmByThread),
-          runningLoops: [...runningLoops],
-          browserSubs: Object.fromEntries(
-            [...browserSubs.entries()].map(([threadId, set]) => [threadId, set.size])
-          ),
-        },
-      });
-    } catch (err) {
-      console.error(err);
-      res.status(500).json({ error: "Failed to load debug state" });
-    }
+    res.json({
+      pool,
+      assignments,
+      inMemory: {
+        connectedExternalIds: [...vmSockets.keys()],
+        vmByThread: Object.fromEntries(vmByThread),
+        runningLoops: [...runningLoops],
+        browserSubs: Object.fromEntries(
+          [...browserSubs.entries()].map(([threadId, set]) => [threadId, set.size])
+        ),
+      },
+      note: "VM pool + assignments are in-memory only (not persisted to DB).",
+    });
   });
 
   router.get("/threads", async (_req: Request, res: Response) => {
@@ -170,27 +146,16 @@ export function createHttpRouter(): Router {
         return;
       }
 
-      const vm = await findHealthyUnassignedVm();
-      if (!vm) {
-        res.status(503).json({ error: "No healthy unassigned VM available" });
-        return;
-      }
-      if (!vmSockets.has(vm.externalId)) {
+      const externalId = findAvailableVm();
+      if (!externalId) {
         res.status(503).json({ error: "No healthy unassigned VM available" });
         return;
       }
 
       const thread = await Thread.create({ userId: DEMO_USER_ID });
-      await Assignment.create({
-        vmId: vm.id,
-        threadId: thread.id,
-        status: "active",
-      });
-      vmByThread.set(thread.id, vm.externalId);
-      cpLog(
-        `new assignment thread=${thread.id} → VM ${vm.externalId} (${vm.id})`
-      );
-      sendAssignment(vm.externalId, thread.id);
+      assignVmToThread(thread.id, externalId);
+      cpLog(`new assignment thread=${thread.id} → VM ${externalId}`);
+      sendAssignment(externalId, thread.id);
 
       const { transcriptId, key } = await createTranscriptWithUserPrompt(
         thread.id,
@@ -235,20 +200,16 @@ export function createHttpRouter(): Router {
         return;
       }
 
-      const assignment = await Assignment.findOne({ where: { threadId } });
-      if (!assignment) {
+      const externalId = getAssignedVm(threadId);
+      if (!externalId) {
         res.status(503).json({ error: "No assignment for thread" });
         return;
       }
-      const vm = await VirtualMachine.findByPk(assignment.vmId);
-      if (!vm || !vmSockets.has(vm.externalId)) {
+      if (!vmSockets.has(externalId)) {
         res.status(503).json({ error: "Sticky VM not connected" });
         return;
       }
-      vmByThread.set(threadId, vm.externalId);
-      cpLog(
-        `follow-up on sticky assignment thread=${threadId} → VM ${vm.externalId}`
-      );
+      cpLog(`follow-up on sticky assignment thread=${threadId} → VM ${externalId}`);
 
       const { transcriptId, key } = await createTranscriptWithUserPrompt(
         threadId,

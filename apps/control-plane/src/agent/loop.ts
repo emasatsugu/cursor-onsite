@@ -7,10 +7,8 @@ import type {
 } from "@poc/shared";
 import type { ChatCompletionMessageParam } from "openai/resources/chat/completions";
 import {
-  Assignment,
   BlobStorage,
   Transcript,
-  VirtualMachine,
 } from "../db/index.js";
 import { runningLoops, vmByThread } from "../memory/state.js";
 import { broadcastToThread } from "../ws/browser.js";
@@ -229,15 +227,4 @@ export async function runAgentLoop(
   } finally {
     runningLoops.delete(threadId);
   }
-}
-
-export async function findHealthyUnassignedVm(): Promise<VirtualMachine | null> {
-  const healthy = await VirtualMachine.findAll({ where: { status: "healthy" } });
-  for (const vm of healthy) {
-    const active = await Assignment.findOne({
-      where: { vmId: vm.id, status: "active" },
-    });
-    if (!active) return vm;
-  }
-  return null;
 }
