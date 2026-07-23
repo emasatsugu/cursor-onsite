@@ -1,0 +1,14 @@
+{
+  "name": "cursor-onsite-poc",
+  "private": true,
+  "workspaces": [
+    "packages/*",
+    "apps/*"
+  ],
+  "scripts": {
+    "dev:web": "npm run dev -w @poc/web",
+    "stub": "npm run stub -w @poc/web",
+    "dev:stub": "npm run stub -w @poc/web",
+    "build:web": "npm run build -w @poc/web"
+  }
+}
