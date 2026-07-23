@@ -19,6 +19,8 @@ Rest of this file keeps the detailed ID catalog (capacity, persist, browser, tra
 
 ## 0. Die-timing matrix (VM × CP × loop phase)
 
+**Normative target contract** (grace / redispatch / browser UX / resume-from-transcript): see `final-writeup.md` → Failure modes. Below is **today’s** behavior.
+
 | When | Meaning |
 |---|---|
 | **Between loops** | No `runningLoops` |
@@ -26,16 +28,18 @@ Rest of this file keeps the detailed ID catalog (capacity, persist, browser, tra
 | **Loop gap** | Loop running, not in OpenAI stream or tool waiter (post-assistant / pre-tools, post-tools / pre-next-OpenAI, end persist) |
 | **Mid–tool** | Blocked on `waitForToolCallResponse` |
 
-| When | VM dies | Owning CP dies |
+| When | VM dies (today) | Owning CP dies (today) |
 |---|---|---|
-| **Between loops** | **Sticky cleared** (assignment `completed`, cache dropped; thread+blobs kept); next prompt reassigns + restore | Boot **clears stickies** fleet-wide (shared DB); next prompt via proxy |
+| **Between loops** | **Sticky cleared**; next prompt reassigns + restore | Boot **clears stickies** fleet-wide; next prompt via proxy |
 | **Mid–OpenAI** | Stream **not** aborted; sticky cleared; then done/persist skip or fail at tools → `agent_loop_error`; possible **T-02** | Process gone; no error event; blob usually `[user]` only (**T-01**) |
 | **Loop gap** | Sticky cleared; loop continues until next VM need → usually `agent_loop_error`; **T-02** if tools pending in blob | Silent; blob = last boundary; **T-02** if assistant+`tool_calls` without tools |
-| **Mid–tool** | Reject waiters → `agent_loop_error`; sticky cleared; **T-02**; unpersisted edits possible | Silent; **T-02** likely; orphan tool on VM |
+| **Mid–tool** | Reject waiters **immediately** → `agent_loop_error`; sticky cleared; **T-02**; unpersisted edits possible | Silent; **T-02** likely; orphan tool on VM |
 
-**Sticky cleared** = tear down thread→VM binding only (`assignments` → `completed` + drop `vmByThread`). Does **not** delete the thread or transcripts; VM returns to the free pool on reconnect (no auto rebind).
+**Sticky cleared** = tear down thread→VM binding only. Does **not** delete the thread or transcripts.
 
-Full narrative cells: `final-writeup.md` → Failure modes.
+**Target (not all implemented):** VM mid-tool → grace + same-VM redispatch once; hard fail → **T-02** repair; user new prompt resumes from durable transcript (incl. completed tool results) + last persist. CP death → browser-owned fail UX (no grace continue). Proxy dead CP → scrub + evacuate (**PX-01**, done).
+
+Full narrative + **undiscussed gaps**: `final-writeup.md` → Failure modes.
 
 ---
 
@@ -76,7 +80,7 @@ Full narrative cells: `final-writeup.md` → Failure modes.
 | **CP-06** | Broadcast with 0 browser subscribers | `broadcastToThread` | Events dropped (no replay) | `GET /threads/:id` boundary-accurate only | Missed live stream | **Handled** (best-effort WS) |
 | **CP-07** | Unmatched `tool_call_response` | No waiter | Log only | Ignored | None / earlier timeout | **Handled** |
 | **CP-08** | Hydrated sticky after CP restart, no browser | — | — | **N/A** — boot clears actives; no orphan sticky | — | **Handled** (by clear-on-boot) |
-| **PX-01** | Dead CP instance behind proxy (process down or `/debug/unhealthy`) | Health probe fail / force flag / upstream connect error | Sticky `owner_cp_id` would black-hole traffic | Scrub: complete stickies for that CP’s VMs, clear `owner_cp_id`, mark VMs unhealthy; skip dead owner; HTTP/WS **one retry** on a live CP | Follow-up/create/VM register land on live CP; mid-gen on dead CP still orphaned (no resume) | **Handled** |
+| **PX-01** | Dead CP instance behind proxy (process down or `/debug/unhealthy`) | Health probe fail / force flag / upstream connect error | Sticky `owner_cp_id` would black-hole traffic | Scrub ownership; skip dead owner; HTTP/WS **one retry**; **evacuate** VM/browser tunnels so VMs re-register on a live CP | Follow-up/create land on live CP after ~2s reconnect; mid-gen on dead CP still orphaned | **Handled** |
 | **BR-01** | Browser tab close / navigate away | WS `close` → `removeBrowserSubFromAll` | Subs → 0; `threadSubsEmptySince` set | Loop keeps running if any. **`maybeReclaimThreads`** (default immediate when idle) | Return: history refresh; live mid-stream may be missing | **Handled** |
 | **BR-02** | Browser WS blip / sleep + client reconnect (~1.5s) | Close then re-open + re-`subscribe` | With `IDLE_RECLAIM_MS=0`, reclaim may run on close **before** reconnect | Set grace (e.g. `3000`) to tolerate blips. No event replay either way | Possible missed deltas; assignment may churn to another VM on next prompt | **Partial** |
 | **BR-03** | Browser idle reclaim | Last sub gone + no loop; `IDLE_RECLAIM_MS` (default **0**) | Best-effort `persist` → `unassign` → `persistClear` | VM back in pool. Next follow-up on-demand assign + `restore` | Usually invisible if persist OK | **Handled** |
@@ -147,13 +151,15 @@ Browser          CP                         VM-A              VM-B
 
 ## 4. Priority to harden next
 
-Ordered by demo risk / user pain:
+Aligned with `final-writeup.md` target contract:
 
-1. **T-02** — repair/truncate inconsistent turn blobs after mid-tool `agent_loop_error` (follow-ups can hard-fail against OpenAI).
-2. **VM-10 / VM-11 / VM-12** — surface `restore`/`persist` failures to CP (fail loop or block reclaim/reassign) instead of log-only + free-anyway.
-3. **BR-02** — default grace for reclaim (`IDLE_RECLAIM_MS>0`) and/or UI “disconnected; refresh history” on WS reconnect during a run.
-4. **T-03** — explicit retry/replay UX after `agent_loop_error`.
-5. **Later optimization:** hydrate stickies across CP restart + same-VM rebind (optional; not needed for correctness if `persist`/`restore` work).
+1. **T-02** — repair inconsistent turn blobs after mid-tool / mid-gap / CP death.
+2. **VM mid-tool grace** — park waiters; same-`externalId` reconnect → redispatch once; else hard fail + (1).
+3. **Browser orphan-run UX** — detect WS drop while running (CP cannot emit `agent_loop_error`).
+4. **VM-10 / VM-11 / VM-12** — surface restore/persist failures (plan only sketched).
+5. **T-03** — replay/regenerate product rules (undiscussed beyond “flag it”).
+
+**Undiscussed gaps** (do not treat as planned): OpenAI fail-fast-during-stream; parallel-batch redispatch; idempotent mutating redispatch; full 3-surface blip continue; soften clear-all-on-boot; distributed assign lock. See writeup.
 
 ---
 
